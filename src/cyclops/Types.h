@@ -12,7 +12,7 @@
 #include <vector>
 #include <map>
 
-#if defined(__GXX_EXPERIMENTAL_CXX0X__) || __cplusplus >= 201103L
+// #if defined(__GXX_EXPERIMENTAL_CXX0X__) || __cplusplus >= 201103L
 // C++11
     #include <memory>
     namespace bsccs {
@@ -20,15 +20,15 @@
         using std::make_shared;
         using std::unique_ptr;
     }
-#else
+// #else
 // C++98 (R build)
-    #include "boost/smart_ptr.hpp"
-    namespace bsccs {
-        using boost::shared_ptr;
-        using boost::make_shared;
-        using boost::unique_ptr;
-    }
-#endif
+//    #include "boost/smart_ptr.hpp"
+//    namespace bsccs {
+//        using boost::shared_ptr;
+//        using boost::make_shared;
+//        using boost::unique_ptr;
+//    }
+// #endif
 
 #ifdef WIN_BUILD
     #include <tr1/unordered_map>
@@ -102,7 +102,8 @@ enum PriorType {
 	NONE = 0,
 	LAPLACE,
 	NORMAL,
-	BAR_UPDATE
+	BAR_UPDATE,
+	JEFFREYS
 };
 
 } // namespace priors
@@ -126,7 +127,8 @@ enum UpdateReturnFlags {
 	FAIL,
 	MAX_ITERATIONS,
 	ILLCONDITIONED,
-	MISSING_COVARIATES
+	MISSING_COVARIATES,
+	POOR_BLR_STEP
 };
 
 typedef std::vector<IdType> ProfileVector;

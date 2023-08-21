@@ -1,3 +1,33 @@
+Cyclops v3.3.1
+==============
+
+Changes:
+
+1. fix uninitialized value in detected in computeAsymptoticPrecisionMatrix(); value was priorType
+2. fix memory leak caused by call to ::Rf_error()
+3. fix line-endings on Makevar on windows
+
+Cyclops v3.3.0
+==============
+
+Changes:
+
+1. bump for R 4.2
+2. fix CRAN warnings
+    a. used `minValues`
+3. fix CRAN notes
+    a. remove explicit dependence on C++11 (except for R <= 4.0)   
+
+Cyclops v3.2.0
+==============
+
+Changes:
+
+1. fixed likelihood profiling when non-convex due to numerical instability
+2. fixed parsing of 64-bit covariate IDs
+3. fix BLR convergence criterion when there are 0 (survival) events
+3. add Jeffrey's prior for single regression coefficient
+
 Cyclops v3.1.2
 ==============
 

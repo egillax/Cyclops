@@ -30,3 +30,7 @@ extras
 CRAN-RELEASE
 .Rdata
 .DS_Store
+*.gcno
+*.gcda
+src/Makevars
+src/Makevars.win
