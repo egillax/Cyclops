@@ -94,7 +94,8 @@ public:
 				const std::vector<double>& baseVariance,
 				const ProfileVector& flatPrior,
 				const HierarchicalChildMap& map,
-				const NeighborhoodMap& neighborhood);
+				const NeighborhoodMap& neighborhood,
+                bool uniqueCheck);
 
     void setNoiseLevel(bsccs::NoiseLevels noiseLevel);
 
@@ -118,14 +119,16 @@ protected:
     priors::JointPriorPtr makePrior(
             const std::vector<std::string>& priorName,
             bsccs::priors::PriorFunctionPtr& priorFunctionPtr,
-            const ProfileVector& flatPrior);
+            const ProfileVector& flatPrior,
+            bool uniqueCheck);
 
 		priors::JointPriorPtr makePrior(
 				const std::vector<std::string>& basePriorName,
 				const std::vector<double>& baseVariance,
 				const ProfileVector& flatPrior,
 				const HierarchicalChildMap& map,
-				const NeighborhoodMap& neighborhood);
+				const NeighborhoodMap& neighborhood,
+                bool uniqueCheck);
 
     void initializeModelImpl(
             AbstractModelData** modelData,

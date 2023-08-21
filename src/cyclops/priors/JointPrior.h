@@ -51,7 +51,7 @@ public:
         }
     }
 
-	void addVarianceParameters(const std::vector<VariancePtr>& ptrs) {
+	void  addVarianceParameters(const std::vector<VariancePtr>& ptrs) {
 	    for (auto ptr : ptrs) {
 		    addVarianceParameter(ptr);
 	    }
@@ -82,16 +82,16 @@ class MixtureJointPrior : public JointPrior {
 public:
 	typedef std::vector<PriorPtr> PriorList;
 
-	MixtureJointPrior(PriorPtr defaultPrior, int length) : JointPrior(),
+	MixtureJointPrior(PriorPtr defaultPrior, int length, bool uniqueCheck) : JointPrior(),
 			listPriors(length, defaultPrior), uniquePriors(1, defaultPrior) {
-		addVarianceParameters(defaultPrior->getVarianceParameters());
+		addVarianceParameters(defaultPrior->getVarianceParameters(), uniqueCheck);
 	}
 
-	void changePrior(PriorPtr newPrior, int index) {
+	void changePrior(PriorPtr newPrior, int index,  bool uniqueCheck) {
 		// TODO assert(index < listPriors.size());
 		listPriors[index] = newPrior;
 		uniquePriors.push_back(newPrior);
-		addVarianceParameters(newPrior->getVarianceParameters());
+		addVarianceParameters(newPrior->getVarianceParameters(), uniqueCheck);
 	}
 
 	const std::string getDescription() const {
@@ -146,6 +146,21 @@ public:
 		return listPriors[index]->getKktBoundary();
 	}
 
+    void addVarianceParameter(const VariancePtr& ptr, bool uniqueCheck) {
+        if (uniqueCheck) {
+            if (std::find(variance.begin(), variance.end(), ptr) == variance.end()) {
+                variance.push_back(ptr);
+            }
+        } else {
+            variance.push_back(ptr);
+        }
+    }
+
+    void  addVarianceParameters(const std::vector<VariancePtr>& ptrs, bool uniqueCheck) {
+        for (auto ptr : ptrs) {
+            addVarianceParameter(ptr, uniqueCheck);
+        }
+    }
 	bool getSupportsKktSwindle(void) const {
 		// Return true if *any* prior supports swindle
 		for (auto&prior : uniquePriors) {

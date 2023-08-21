@@ -184,9 +184,11 @@ fitCyclopsModel <- function(cyclopsData,
                 }
             }
         }
-
+        if (is.null(prior$uniqueCheck)) {
+            prior$uniqueCheck = TRUE
+        }
         .cyclopsSetPrior(cyclopsData$cyclopsInterfacePtr, prior$priorType, prior$variance,
-                         prior$exclude, graph, neighborhood)
+                         prior$exclude, graph, neighborhood, prior$uniqueCheck)
     }
 
     if (control$selectorType == "auto") {

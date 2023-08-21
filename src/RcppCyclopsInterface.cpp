@@ -231,7 +231,7 @@ Eigen::MatrixXd cyclopsGetFisherInformation(SEXP inRcppCcdInterface, const SEXP 
 // [[Rcpp::export(".cyclopsSetPrior")]]
 void cyclopsSetPrior(SEXP inRcppCcdInterface, const std::vector<std::string>& priorTypeName,
         const std::vector<double>& variance, SEXP excludeNumeric, SEXP sexpGraph,
-        Rcpp::List sexpNeighborhood) {
+        Rcpp::List sexpNeighborhood, bool uniqueCheck = true) {
 	using namespace bsccs;
 
 	XPtr<RcppCcdInterface> interface(inRcppCcdInterface);
@@ -267,7 +267,7 @@ void cyclopsSetPrior(SEXP inRcppCcdInterface, const std::vector<std::string>& pr
  		}
  	}
 
-    interface->setPrior(priorTypeName, variance, exclude, map, neighborhood);
+    interface->setPrior(priorTypeName, variance, exclude, map, neighborhood, uniqueCheck);
 }
 
 #include "priors/PriorFunction.h"
@@ -747,13 +747,15 @@ void RcppCcdInterface::setNoiseLevel(bsccs::NoiseLevels noiseLevel) {
 void RcppCcdInterface::setParameterizedPrior(const std::vector<std::string>& priorName,
                              bsccs::priors::PriorFunctionPtr& priorFunctionPtr,
                              const ProfileVector& flatPrior) {
-    auto prior = makePrior(priorName, priorFunctionPtr, flatPrior);
+    bool uniqueCheck = true;
+    auto prior = makePrior(priorName, priorFunctionPtr, flatPrior, uniqueCheck);
     ccd->setPrior(prior);
 }
 
 priors::JointPriorPtr RcppCcdInterface::makePrior(const std::vector<std::string>& priorName,
                                                   bsccs::priors::PriorFunctionPtr& priorFunctionPtr,
-                                                  const ProfileVector& flatPrior) {
+                                                  const ProfileVector& flatPrior,
+                                                  bool uniqueCheck = true) {
 
     const auto dataLength = modelData->getNumberOfCovariates();
 
@@ -766,27 +768,27 @@ priors::JointPriorPtr RcppCcdInterface::makePrior(const std::vector<std::string>
 
     auto first = bsccs::priors::makePrior(parsePriorType(priorName[0]),
                                           priorFunctionPtr, 0);
-    auto prior = bsccs::make_shared<bsccs::priors::MixtureJointPrior>(first, dataLength);
+    auto prior = bsccs::make_shared<bsccs::priors::MixtureJointPrior>(first, dataLength, uniqueCheck);
 
     for (size_t i = 1; i < dataLength; ++i) {
         auto columnPrior = bsccs::priors::makePrior(parsePriorType(priorName[i]),
                                                     priorFunctionPtr, i);
-        prior->changePrior(columnPrior, i);
+        prior->changePrior(columnPrior, i, uniqueCheck);
     }
 
     return prior;
 }
 
 void RcppCcdInterface::setPrior(const std::vector<std::string>& basePriorName, const std::vector<double>& baseVariance,
-		const ProfileVector& flatPrior, const HierarchicalChildMap& map, const NeighborhoodMap& neighborhood) {
+		const ProfileVector& flatPrior, const HierarchicalChildMap& map, const NeighborhoodMap& neighborhood, bool uniqueCheck = true) {
 	using namespace bsccs::priors;
 
-	JointPriorPtr prior = makePrior(basePriorName, baseVariance, flatPrior, map, neighborhood);
+	JointPriorPtr prior = makePrior(basePriorName, baseVariance, flatPrior, map, neighborhood, uniqueCheck);
 	ccd->setPrior(prior);
 }
 
 priors::JointPriorPtr RcppCcdInterface::makePrior(const std::vector<std::string>& basePriorName, const std::vector<double>& baseVariance,
-		const ProfileVector& flatPrior, const HierarchicalChildMap& hierarchyMap, const NeighborhoodMap& neighborhood) {
+		const ProfileVector& flatPrior, const HierarchicalChildMap& hierarchyMap, const NeighborhoodMap& neighborhood, bool uniqueCheck) {
 	using namespace bsccs::priors;
 
     const size_t length = modelData->getNumberOfCovariates();
@@ -798,11 +800,11 @@ priors::JointPriorPtr RcppCcdInterface::makePrior(const std::vector<std::string>
         && baseVariance.size() == length) {
 
         auto first = bsccs::priors::CovariatePrior::makePrior(parsePriorType(basePriorName[0]), baseVariance[0]);
-        auto prior = bsccs::make_shared<MixtureJointPrior>(first, length);
+        auto prior = bsccs::make_shared<MixtureJointPrior>(first, length, uniqueCheck);
 
         for (size_t i = 1; i < length; ++i) {
             auto columnPrior = bsccs::priors::CovariatePrior::makePrior(parsePriorType(basePriorName[i]), baseVariance[i]);
-            prior->changePrior(columnPrior, i);
+            prior->changePrior(columnPrior, i, uniqueCheck);
         }
 
 //         std::cerr << "Constructed variable prior per column" << std::endl;
@@ -843,7 +845,7 @@ priors::JointPriorPtr RcppCcdInterface::makePrior(const std::vector<std::string>
  	} else {
  		const int length =  modelData->getNumberOfCovariates();
  		bsccs::shared_ptr<MixtureJointPrior> mixturePrior = bsccs::make_shared<MixtureJointPrior>(
- 						singlePrior, length
+ 						singlePrior, length, uniqueCheck
  				);
 
 		if (flatPrior.size() > 0) {
@@ -856,7 +858,7 @@ priors::JointPriorPtr RcppCcdInterface::makePrior(const std::vector<std::string>
 					error << "Variable " << *it << " not found.";
 					handleError(error.str());
 				} else {
-					mixturePrior->changePrior(noPrior, index);
+					mixturePrior->changePrior(noPrior, index, uniqueCheck);
 				}
 			}
 		}
@@ -868,7 +870,7 @@ priors::JointPriorPtr RcppCcdInterface::makePrior(const std::vector<std::string>
 
  			VariancePtr baseVariance0 = singlePrior->getVarianceParameters()[0];
  		    VariancePtr baseVariance1 = CovariatePrior::makeVariance(baseVariance[1]);
- 		    mixturePrior->addVarianceParameter(baseVariance1);
+ 		    mixturePrior->addVarianceParameter(baseVariance1, uniqueCheck);
 
  			for (const auto& element : neighborhood) {
  				int index = modelData->getColumnIndexByName(element.first);
@@ -892,7 +894,7 @@ priors::JointPriorPtr RcppCcdInterface::makePrior(const std::vector<std::string>
  					PriorPtr fusedPrior = bsccs::make_shared<FusedLaplacePrior>(
  					    baseVariance0, baseVariance1, neighbors
  					);
- 					mixturePrior->changePrior(fusedPrior, index);
+ 					mixturePrior->changePrior(fusedPrior, index, uniqueCheck);
  				}
  			}
  		}
