@@ -590,7 +590,8 @@ void cyclopsSetControl(SEXP inRcppCcdInterface,
 		bool useAutoSearch, int fold, int foldToCompute, double lowerLimit, double upperLimit, int gridSteps,
 		const std::string& noiseLevel, int threads, int seed, bool resetCoefficients, double startingVariance,
         bool useKKTSwindle, int swindleMultipler, const std::string& selectorType, double initialBound,
-        int maxBoundCount, const std::string& algorithm, bool doItAll, bool syncCV
+        int maxBoundCount, const std::string& algorithm, bool doItAll, bool syncCV,
+        const std::string& logisticKernel
 		) {
 	using namespace bsccs;
 	XPtr<RcppCcdInterface> interface(inRcppCcdInterface);
@@ -607,6 +608,13 @@ void cyclopsSetControl(SEXP inRcppCcdInterface,
 
     if (algorithm == "mm") {
         args.modeFinding.algorithmType = AlgorithmType::MM;
+    }
+    if (logisticKernel == "auto" || logisticKernel == "sparse-residual") {
+        args.modeFinding.logisticKernel = LogisticKernelType::SPARSE_RESIDUAL;
+    } else if (logisticKernel == "legacy") {
+        args.modeFinding.logisticKernel = LogisticKernelType::LEGACY;
+    } else {
+        Rcpp::stop("Unknown logisticKernel: " + logisticKernel);
     }
 
 	// Cross validation control
@@ -1361,4 +1369,3 @@ RcppCcdInterface::~RcppCcdInterface() {
 }
 
 } // namespace
-

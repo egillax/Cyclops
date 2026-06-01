@@ -617,6 +617,7 @@ print.cyclopsFit <- function(x, show.call=TRUE ,...) {
 #' @param algorithm             String: name of fitting algorithm to employ; default is `ccd`
 #' @param doItAll               Currently unused
 #' @param syncCV                Currently unused
+#' @param logisticKernel        String: logistic CCD kernel (\code{"auto"}, \code{"sparse-residual"}, \code{"legacy"})
 #'
 #' Todo: Describe convegence types
 #'
@@ -648,7 +649,8 @@ createControl <- function(maxIterations = 1000,
                           maxBoundCount = 5,
                           algorithm = "ccd",
                           doItAll = TRUE,
-                          syncCV = FALSE) {
+                          syncCV = FALSE,
+                          logisticKernel = "auto") {
     validCVNames = c("grid", "auto")
     stopifnot(cvType %in% validCVNames)
 
@@ -660,6 +662,7 @@ createControl <- function(maxIterations = 1000,
 
     validAlgorithmNames = c("ccd", "mm")
     stopifnot(algorithm %in% validAlgorithmNames)
+    stopifnot(logisticKernel %in% c("auto", "sparse-residual", "legacy"))
 
     structure(list(maxIterations = maxIterations,
                    tolerance = tolerance,
@@ -683,7 +686,8 @@ createControl <- function(maxIterations = 1000,
                    maxBoundCount = maxBoundCount,
                    algorithm = algorithm,
                    doItAll = doItAll,
-                   syncCV = syncCV),
+                   syncCV = syncCV,
+                   logisticKernel = logisticKernel),
               class = "cyclopsControl")
 }
 
@@ -833,6 +837,9 @@ getCrossValidationInfo <- function(object) {
         if (is.null(control$algorithm) || is.na(control$algorithm)) { # Provide backwards compatibility
             control$algorithm <- "ccd"
         }
+        if (is.null(control$logisticKernel) || is.na(control$logisticKernel)) {
+            control$logisticKernel <- "auto"
+        }
 
         .cyclopsSetControl(cyclopsInterfacePtr, control$maxIterations, control$tolerance,
                            control$convergenceType, control$autoSearch, control$fold,
@@ -841,7 +848,8 @@ getCrossValidationInfo <- function(object) {
                            control$noiseLevel, control$threads, control$seed, control$resetCoefficients,
                            control$startingVariance, control$useKKTSwindle, control$tuneSwindle,
                            control$selectorType, control$initialBound, control$maxBoundCount,
-                           control$algorithm, control$doItAll, control$syncCV
+                           control$algorithm, control$doItAll, control$syncCV,
+                           control$logisticKernel
                           )
         return(control)
     }

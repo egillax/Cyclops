@@ -73,7 +73,12 @@ template <class BaseModel,typename RealType>
 ModelSpecifics<BaseModel,RealType>::ModelSpecifics(const ModelData<RealType>& input)
 	: AbstractModelSpecifics(input), BaseModel(input.getYVectorRef(), input.getTimeVectorRef()),
    modelData(input),
-   hX(modelData.getX())
+   hX(modelData.getX()),
+   sparseLogisticWeightedColumnViewsReady(false),
+   sparseLogisticWeightedRowsHaveUnitWeight(false),
+   sparseLogisticStateReady(false),
+   sparseLogisticXBetaDirty(false),
+   sparseLogisticExpXBetaDirty(false)
    // hY(input.getYVectorRef()),
    // hOffs(input.getTimeVectorRef())
  //  hPidOriginal(input.getPidVectorRef()), hPid(const_cast<int*>(hPidOriginal.data())),
@@ -106,14 +111,26 @@ double ModelSpecifics<BaseModel,RealType>::getGradientObjective(bool useCrossVal
     auto start = bsccs::chrono::steady_clock::now();
 #endif
 
-		auto& xBeta = getXBeta();
-
 		RealType criterion = 0;
-		if (useCrossValidation) {
+		if (sparseLogisticXBetaDirty && std::is_same<BaseModel, LogisticRegression<RealType>>::value) {
+			if (useCrossValidation) {
+				for (const int i : sparseLogisticCaseRows) {
+					if (hKWeight[i] != static_cast<RealType>(0.0)) {
+						criterion += sparseLogisticLogOdds(sparseLogisticFitted[i]) * hKWeight[i];
+					}
+				}
+			} else {
+				for (const int i : sparseLogisticCaseRows) {
+					criterion += sparseLogisticLogOdds(sparseLogisticFitted[i]);
+				}
+			}
+		} else if (useCrossValidation) {
+			auto& xBeta = getXBeta();
 			for (int i = 0; i < K; i++) {
 				criterion += xBeta[i] * hY[i] * hKWeight[i];
 			}
 		} else {
+			auto& xBeta = getXBeta();
 			for (int i = 0; i < K; i++) {
 				criterion += xBeta[i] * hY[i];
             }
@@ -293,6 +310,7 @@ void ModelSpecifics<BaseModel,RealType>::initializeMM(
 
 template <class BaseModel,typename RealType>
 const std::vector<double> ModelSpecifics<BaseModel,RealType>::getXBeta() {
+	syncSparseLogisticState();
     return std::vector<double>(std::begin(hXBeta), std::end(hXBeta));
 }
 
@@ -303,6 +321,9 @@ const std::vector<double> ModelSpecifics<BaseModel,RealType>::getXBetaSave() {
 
 template <class BaseModel,typename RealType>
 void ModelSpecifics<BaseModel,RealType>::zeroXBeta() {
+	sparseLogisticStateReady = false;
+	sparseLogisticXBetaDirty = false;
+	sparseLogisticExpXBetaDirty = false;
 	std::fill(std::begin(hXBeta), std::end(hXBeta), 0.0);
 }
 
@@ -319,6 +340,9 @@ void ModelSpecifics<BaseModel,RealType>::saveXBeta() {
 
 template <class BaseModel,typename RealType>
 void ModelSpecifics<BaseModel,RealType>::computeXBeta(double* beta, bool useWeights) {
+	sparseLogisticStateReady = false;
+	sparseLogisticXBetaDirty = false;
+	sparseLogisticExpXBetaDirty = false;
 
     if (!hXt) {
         initializeMmXt();
@@ -400,6 +424,8 @@ void ModelSpecifics<BaseModel,RealType>::axpy(RealType* y, const RealType alpha,
 
 template <class BaseModel,typename RealType>
 void ModelSpecifics<BaseModel,RealType>::axpyXBeta(const double beta, const int j) {
+	syncSparseLogisticState();
+	sparseLogisticStateReady = false;
 
 #ifdef CYCLOPS_DEBUG_TIMING
     auto start = bsccs::chrono::steady_clock::now();
@@ -434,6 +460,10 @@ void ModelSpecifics<BaseModel,RealType>::axpyXBeta(const double beta, const int 
 // ESK: Added cWeights (censoring weights) as an input
 template <class BaseModel,typename RealType>
 void ModelSpecifics<BaseModel,RealType>::setWeights(double* inWeights, double *cenWeights, bool useCrossValidation) {
+	syncSparseLogisticState();
+	sparseLogisticStateReady = false;
+	invalidateSparseLogisticWeightedColumnViews();
+
 	// Set K weights
 	if (hKWeight.size() != K) {
 		hKWeight.resize(K);
@@ -631,9 +661,20 @@ double ModelSpecifics<BaseModel,RealType>::getLogLikelihood(bool useCrossValidat
 #ifdef CYCLOPS_DEBUG_TIMING
 	auto start = bsccs::chrono::steady_clock::now();
 #endif
-
 	RealType logLikelihood = static_cast<RealType>(0.0);
-	if (useCrossValidation) {
+	if (sparseLogisticXBetaDirty && std::is_same<BaseModel, LogisticRegression<RealType>>::value) {
+		if (useCrossValidation) {
+			for (const int i : sparseLogisticCaseRows) {
+				if (hKWeight[i] != static_cast<RealType>(0.0)) {
+					logLikelihood += sparseLogisticLogOdds(sparseLogisticFitted[i]) * hKWeight[i];
+				}
+			}
+		} else {
+			for (const int i : sparseLogisticCaseRows) {
+				logLikelihood += sparseLogisticLogOdds(sparseLogisticFitted[i]);
+			}
+		}
+	} else if (useCrossValidation) {
 		for (size_t i = 0; i < K; i++) {
 			logLikelihood += BaseModel::logLikeNumeratorContrib(hY[i], hXBeta[i]) * hKWeight[i];
 		}
@@ -652,7 +693,11 @@ double ModelSpecifics<BaseModel,RealType>::getLogLikelihood(bool useCrossValidat
 		} else {  // TODO Unnecessary code duplication
 			for (size_t i = 0; i < N; i++) {
 				// Weights modified in computeNEvents()
-				logLikelihood -= BaseModel::logLikeDenominatorContrib(hNWeight[i], denomPid[i]);
+				if (sparseLogisticXBetaDirty && std::is_same<BaseModel, LogisticRegression<RealType>>::value) {
+					logLikelihood -= hNWeight[i] * sparseLogisticLogDenominator(sparseLogisticFitted[i]);
+				} else {
+					logLikelihood -= BaseModel::logLikeDenominatorContrib(hNWeight[i], denomPid[i]);
+				}
 			}
 		}
 	}
@@ -674,7 +719,6 @@ double ModelSpecifics<BaseModel,RealType>::getLogLikelihood(bool useCrossValidat
 
 template <class BaseModel,typename RealType>
 double ModelSpecifics<BaseModel,RealType>::getPredictiveLogLikelihood(double* weights) {
-
 	std::vector<double> saveKWeight;
 	if (BaseModel::cumulativeGradientAndHessian)	{
 
@@ -697,6 +741,15 @@ double ModelSpecifics<BaseModel,RealType>::getPredictiveLogLikelihood(double* we
 	    for (size_t k = 0; k < K; ++k) {
 	        logLikelihood += BaseModel::logPredLikeContrib(hY[k], weights[k], hXBeta[k], &accDenomPid[0], hPid, k); // TODO Going to crash with ties
 	    }
+	} else if (sparseLogisticXBetaDirty && std::is_same<BaseModel, LogisticRegression<RealType>>::value) {
+		for (const int k : sparseLogisticCaseRows) {
+			if (weights[k] != static_cast<RealType>(0.0)) {
+				logLikelihood += weights[k] * (
+					sparseLogisticLogOdds(sparseLogisticFitted[k])
+					- sparseLogisticLogDenominator(sparseLogisticFitted[k])
+				);
+			}
+		}
 	} else { // TODO Unnecessary code duplication
 	    for (size_t k = 0; k < K; ++k) { // TODO Is index of K correct?
 	        logLikelihood += BaseModel::logPredLikeContrib(hY[k], weights[k], hXBeta[k], &denomPid[0], hPid, k);
@@ -714,16 +767,19 @@ double ModelSpecifics<BaseModel,RealType>::getPredictiveLogLikelihood(double* we
 
 template <class BaseModel,typename RealType>
 void ModelSpecifics<BaseModel,RealType>::getPredictiveEstimates(double* y, double* weights){
-
 	if (weights) {
 		for (size_t k = 0; k < K; ++k) {
 			if (weights[k]) {
-				y[k] = BaseModel::predictEstimate(hXBeta[k]);
+				y[k] = sparseLogisticXBetaDirty && std::is_same<BaseModel, LogisticRegression<RealType>>::value
+					? sparseLogisticFitted[k]
+					: BaseModel::predictEstimate(hXBeta[k]);
 			}
 		}
 	} else {
 		for (size_t k = 0; k < K; ++k) {
-			y[k] = BaseModel::predictEstimate(hXBeta[k]);
+			y[k] = sparseLogisticXBetaDirty && std::is_same<BaseModel, LogisticRegression<RealType>>::value
+				? sparseLogisticFitted[k]
+				: BaseModel::predictEstimate(hXBeta[k]);
 		}
 	}
 	// TODO How to remove code duplication above?
@@ -894,6 +950,389 @@ void ModelSpecifics<BaseModel,RealType>::getSchoenfeldResidualsImpl(int index,
         score[4] = static_cast<double>(xHessian);
         score[5] = static_cast<double>(wHessian);
      }
+}
+
+template <class BaseModel,typename RealType>
+bool ModelSpecifics<BaseModel,RealType>::supportsSparseLogisticKernel(int index, bool useWeights) const {
+	return std::is_same<BaseModel, LogisticRegression<RealType>>::value
+		&& index >= 0
+		&& static_cast<size_t>(index) < J;
+}
+
+template <class BaseModel,typename RealType>
+void ModelSpecifics<BaseModel,RealType>::ensureSparseLogisticColumnFormat() {
+	const size_t columns = hX.getNumberOfColumns();
+	if (sparseLogisticColumnFormat.size() == columns) {
+		return;
+	}
+	sparseLogisticColumnFormat.resize(columns);
+	for (size_t j = 0; j < columns; ++j) {
+		sparseLogisticColumnFormat[j] = hX.getFormatType(static_cast<int>(j));
+	}
+}
+
+template <class BaseModel,typename RealType>
+void ModelSpecifics<BaseModel,RealType>::invalidateSparseLogisticWeightedColumnViews() {
+	sparseLogisticWeightedColumnViewsReady = false;
+	sparseLogisticWeightedRows.clear();
+	sparseLogisticWeightedColumnViews.clear();
+	sparseLogisticWeightedRowsHaveUnitWeight = false;
+}
+
+template <class BaseModel,typename RealType>
+void ModelSpecifics<BaseModel,RealType>::ensureSparseLogisticWeightedColumnViews() {
+	if (sparseLogisticWeightedColumnViewsReady) {
+		return;
+	}
+	if (!std::is_same<BaseModel, LogisticRegression<RealType>>::value) {
+		return;
+	}
+	ensureSparseLogisticColumnFormat();
+
+	sparseLogisticWeightedRows.clear();
+	sparseLogisticWeightedRows.reserve(K);
+	sparseLogisticWeightedRowsHaveUnitWeight = true;
+	for (size_t k = 0; k < K; ++k) {
+		if (hKWeight[k] != static_cast<RealType>(0.0)) {
+			sparseLogisticWeightedRows.push_back(static_cast<int>(k));
+			if (hKWeight[k] != static_cast<RealType>(1.0)) {
+				sparseLogisticWeightedRowsHaveUnitWeight = false;
+			}
+		}
+	}
+
+	sparseLogisticWeightedColumnViews.clear();
+	sparseLogisticWeightedColumnViews.resize(J);
+	for (int j = 0; j < static_cast<int>(J); ++j) {
+		auto& view = sparseLogisticWeightedColumnViews[j];
+		switch (sparseLogisticColumnFormat[j]) {
+			case INDICATOR: {
+				const int* rows = hX.getCompressedColumnVector(j);
+				const size_t n = hX.getNumberOfEntries(j);
+				view.rows.reserve(n);
+				for (size_t row = 0; row < n; ++row) {
+					const int k = rows[row];
+					if (hKWeight[k] != static_cast<RealType>(0.0)) {
+						view.rows.push_back(k);
+					}
+				}
+				break;
+			}
+			case SPARSE: {
+				const int* rows = hX.getCompressedColumnVector(j);
+				const RealType* values = hX.getDataVector(j);
+				const size_t n = hX.getNumberOfEntries(j);
+				view.rows.reserve(n);
+				view.values.reserve(n);
+				for (size_t row = 0; row < n; ++row) {
+					const int k = rows[row];
+					if (hKWeight[k] != static_cast<RealType>(0.0)) {
+						view.rows.push_back(k);
+						view.values.push_back(values[row]);
+					}
+				}
+				break;
+			}
+			case DENSE:
+			case INTERCEPT:
+				break;
+		}
+	}
+	sparseLogisticWeightedColumnViewsReady = true;
+}
+
+template <class BaseModel,typename RealType>
+RealType ModelSpecifics<BaseModel,RealType>::sparseLogisticLogOdds(RealType probability) const {
+	const RealType one = static_cast<RealType>(1.0);
+	const RealType zero = static_cast<RealType>(0.0);
+	if (probability <= zero) {
+		return -std::numeric_limits<RealType>::infinity();
+	}
+	if (probability >= one) {
+		return std::numeric_limits<RealType>::infinity();
+	}
+	return std::log(probability) - std::log1p(-probability);
+}
+
+template <class BaseModel,typename RealType>
+RealType ModelSpecifics<BaseModel,RealType>::sparseLogisticLogDenominator(RealType probability) const {
+	const RealType one = static_cast<RealType>(1.0);
+	const RealType zero = static_cast<RealType>(0.0);
+	if (probability <= zero) {
+		return zero;
+	}
+	if (probability >= one) {
+		return std::numeric_limits<RealType>::infinity();
+	}
+	return -std::log1p(-probability);
+}
+
+template <class BaseModel,typename RealType>
+void ModelSpecifics<BaseModel,RealType>::refreshSparseLogisticState(bool useWeights) {
+	if (!std::is_same<BaseModel, LogisticRegression<RealType>>::value) {
+		return;
+	}
+	if (sparseLogisticStateReady) {
+		return;
+	}
+	ensureSparseLogisticColumnFormat();
+	if (sparseLogisticFitted.size() != K) {
+		sparseLogisticFitted.resize(K);
+	}
+	if (sparseLogisticCaseRows.empty()) {
+		sparseLogisticCaseRows.reserve(K);
+		for (size_t i = 0; i < K; ++i) {
+			if (hY[i] != static_cast<RealType>(0.0)) {
+				sparseLogisticCaseRows.push_back(static_cast<int>(i));
+			}
+		}
+	}
+	for (size_t i = 0; i < K; ++i) {
+		const RealType entry = offsExpXBeta[i];
+		sparseLogisticFitted[i] = std::isfinite(entry)
+			? entry / (static_cast<RealType>(1.0) + entry)
+			: static_cast<RealType>(1.0);
+	}
+	sparseLogisticStateReady = true;
+}
+
+template <class BaseModel,typename RealType>
+void ModelSpecifics<BaseModel,RealType>::materializeSparseLogisticExpXBeta() {
+	if (!sparseLogisticExpXBetaDirty) {
+		return;
+	}
+	if (!std::is_same<BaseModel, LogisticRegression<RealType>>::value || !sparseLogisticStateReady) {
+		sparseLogisticExpXBetaDirty = false;
+		return;
+	}
+
+	const RealType one = static_cast<RealType>(1.0);
+	const RealType zero = static_cast<RealType>(0.0);
+	for (size_t i = 0; i < K; ++i) {
+		const RealType p = sparseLogisticFitted[i];
+		if (p <= zero) {
+			offsExpXBeta[i] = zero;
+		} else if (p >= one) {
+			offsExpXBeta[i] = std::numeric_limits<RealType>::infinity();
+		} else {
+			offsExpXBeta[i] = p / (one - p);
+		}
+	}
+	sparseLogisticExpXBetaDirty = false;
+}
+
+template <class BaseModel,typename RealType>
+void ModelSpecifics<BaseModel,RealType>::syncSparseLogisticState() {
+	if (!sparseLogisticXBetaDirty) {
+		return;
+	}
+	if (std::is_same<BaseModel, LogisticRegression<RealType>>::value) {
+		materializeSparseLogisticExpXBeta();
+		for (size_t i = 0; i < K; ++i) {
+			hXBeta[i] = std::log(offsExpXBeta[i]);
+			denomPid[i] = static_cast<RealType>(1.0) + offsExpXBeta[i];
+		}
+	}
+	sparseLogisticXBetaDirty = false;
+}
+
+template <class BaseModel,typename RealType>
+void ModelSpecifics<BaseModel,RealType>::computeSparseLogisticGradientAndHessian(
+		int index, double *ogradient, double *ohessian, bool useWeights) {
+	if (!supportsSparseLogisticKernel(index, useWeights)) {
+		computeGradientAndHessian(index, ogradient, ohessian, useWeights);
+		return;
+	}
+
+	refreshSparseLogisticState(useWeights);
+	if (useWeights) {
+		ensureSparseLogisticWeightedColumnViews();
+	}
+	const RealType* fitted = sparseLogisticFitted.data();
+	const RealType* weights = hKWeight.data();
+	const RealType one = static_cast<RealType>(1.0);
+
+	RealType gradient = static_cast<RealType>(0.0);
+	RealType hessian = static_cast<RealType>(0.0);
+
+	switch (sparseLogisticColumnFormat[index]) {
+		case INDICATOR: {
+			const SparseLogisticWeightedColumnView* view =
+				useWeights ? &sparseLogisticWeightedColumnViews[index] : nullptr;
+			const int* rows = useWeights ? view->rows.data() : hX.getCompressedColumnVector(index);
+			const size_t n = useWeights ? view->rows.size() : hX.getNumberOfEntries(index);
+			RealType gradient0 = static_cast<RealType>(0.0);
+			RealType gradient1 = static_cast<RealType>(0.0);
+			RealType gradient2 = static_cast<RealType>(0.0);
+			RealType gradient3 = static_cast<RealType>(0.0);
+			RealType hessian0 = static_cast<RealType>(0.0);
+			RealType hessian1 = static_cast<RealType>(0.0);
+			RealType hessian2 = static_cast<RealType>(0.0);
+			RealType hessian3 = static_cast<RealType>(0.0);
+			size_t row = 0;
+			for (; row + 3 < n; row += 4) {
+				const int i0 = rows[row];
+				const int i1 = rows[row + 1];
+				const int i2 = rows[row + 2];
+				const int i3 = rows[row + 3];
+				const RealType p0 = fitted[i0];
+				const RealType p1 = fitted[i1];
+				const RealType p2 = fitted[i2];
+				const RealType p3 = fitted[i3];
+				if (useWeights) {
+					const RealType w0 = sparseLogisticWeightedRowsHaveUnitWeight ? one : weights[i0];
+					const RealType w1 = sparseLogisticWeightedRowsHaveUnitWeight ? one : weights[i1];
+					const RealType w2 = sparseLogisticWeightedRowsHaveUnitWeight ? one : weights[i2];
+					const RealType w3 = sparseLogisticWeightedRowsHaveUnitWeight ? one : weights[i3];
+					gradient0 += w0 * p0;
+					gradient1 += w1 * p1;
+					gradient2 += w2 * p2;
+					gradient3 += w3 * p3;
+					hessian0 += w0 * p0 * (one - p0);
+					hessian1 += w1 * p1 * (one - p1);
+					hessian2 += w2 * p2 * (one - p2);
+					hessian3 += w3 * p3 * (one - p3);
+				} else {
+					gradient0 += p0;
+					gradient1 += p1;
+					gradient2 += p2;
+					gradient3 += p3;
+					hessian0 += p0 * (one - p0);
+					hessian1 += p1 * (one - p1);
+					hessian2 += p2 * (one - p2);
+					hessian3 += p3 * (one - p3);
+				}
+			}
+			gradient += gradient0 + gradient1 + gradient2 + gradient3;
+			hessian += hessian0 + hessian1 + hessian2 + hessian3;
+			for (; row < n; ++row) {
+				const int i = rows[row];
+				const RealType p = fitted[i];
+				const RealType w = (useWeights && !sparseLogisticWeightedRowsHaveUnitWeight) ? weights[i] : one;
+				gradient += w * p;
+				hessian += w * p * (one - p);
+			}
+			break;
+		}
+		case SPARSE: {
+			const SparseLogisticWeightedColumnView* view =
+				useWeights ? &sparseLogisticWeightedColumnViews[index] : nullptr;
+			const int* rows = useWeights ? view->rows.data() : hX.getCompressedColumnVector(index);
+			const RealType* values = useWeights ? view->values.data() : hX.getDataVector(index);
+			const size_t n = useWeights ? view->rows.size() : hX.getNumberOfEntries(index);
+			for (size_t row = 0; row < n; ++row) {
+				const int i = rows[row];
+				const RealType x = values[row];
+				const RealType p = fitted[i];
+				const RealType w = (useWeights && !sparseLogisticWeightedRowsHaveUnitWeight) ? weights[i] : one;
+				gradient += w * x * p;
+				hessian += w * x * x * p * (one - p);
+			}
+			break;
+		}
+		case DENSE: {
+			const RealType* values = hX.getDataVector(index);
+			const size_t n = useWeights ? sparseLogisticWeightedRows.size() : K;
+			for (size_t row = 0; row < n; ++row) {
+				const int i = useWeights ? sparseLogisticWeightedRows[row] : static_cast<int>(row);
+				const RealType x = values[i];
+				const RealType p = fitted[i];
+				const RealType w = (useWeights && !sparseLogisticWeightedRowsHaveUnitWeight) ? weights[i] : one;
+				gradient += w * x * p;
+				hessian += w * x * x * p * (one - p);
+			}
+			break;
+		}
+		case INTERCEPT: {
+			const size_t n = useWeights ? sparseLogisticWeightedRows.size() : K;
+			for (size_t row = 0; row < n; ++row) {
+				const int i = useWeights ? sparseLogisticWeightedRows[row] : static_cast<int>(row);
+				const RealType p = fitted[i];
+				const RealType w = (useWeights && !sparseLogisticWeightedRowsHaveUnitWeight) ? weights[i] : one;
+				gradient += w * p;
+				hessian += w * p * (one - p);
+			}
+			break;
+		}
+	}
+
+	gradient -= hXjY[index];
+	*ogradient = static_cast<double>(gradient);
+	*ohessian = static_cast<double>(hessian);
+}
+
+template <class BaseModel,typename RealType>
+void ModelSpecifics<BaseModel,RealType>::updateSparseLogisticState(
+		double delta, int index, bool useWeights) {
+	if (!supportsSparseLogisticKernel(index, useWeights)) {
+		updateXBeta(delta, index, useWeights);
+		return;
+	}
+
+	refreshSparseLogisticState(useWeights);
+	const RealType realDelta = static_cast<RealType>(delta);
+	RealType* fitted = sparseLogisticFitted.data();
+	const RealType one = static_cast<RealType>(1.0);
+	const RealType zero = static_cast<RealType>(0.0);
+
+	auto advanceProbability = [one, zero](const RealType p, const RealType multiplier) {
+		const RealType numerator = multiplier * p;
+		const RealType denominator = (one - p) + numerator;
+		return denominator > zero ? numerator / denominator : one;
+	};
+
+	switch (sparseLogisticColumnFormat[index]) {
+		case INDICATOR: {
+			const RealType multiplier = std::exp(realDelta);
+			const int* rows = hX.getCompressedColumnVector(index);
+			const size_t n = hX.getNumberOfEntries(index);
+			size_t row = 0;
+			for (; row + 3 < n; row += 4) {
+				const int i0 = rows[row];
+				const int i1 = rows[row + 1];
+				const int i2 = rows[row + 2];
+				const int i3 = rows[row + 3];
+				fitted[i0] = advanceProbability(fitted[i0], multiplier);
+				fitted[i1] = advanceProbability(fitted[i1], multiplier);
+				fitted[i2] = advanceProbability(fitted[i2], multiplier);
+				fitted[i3] = advanceProbability(fitted[i3], multiplier);
+			}
+			for (; row < n; ++row) {
+				const int i = rows[row];
+				fitted[i] = advanceProbability(fitted[i], multiplier);
+			}
+			break;
+		}
+		case SPARSE: {
+			const int* rows = hX.getCompressedColumnVector(index);
+			const RealType* values = hX.getDataVector(index);
+			const size_t n = hX.getNumberOfEntries(index);
+			for (size_t row = 0; row < n; ++row) {
+				const int i = rows[row];
+				const RealType multiplier = std::exp(realDelta * values[row]);
+				fitted[i] = advanceProbability(fitted[i], multiplier);
+			}
+			break;
+		}
+		case DENSE: {
+			const RealType* values = hX.getDataVector(index);
+			for (size_t i = 0; i < K; ++i) {
+				const RealType multiplier = std::exp(realDelta * values[i]);
+				fitted[i] = advanceProbability(fitted[i], multiplier);
+			}
+			break;
+		}
+		case INTERCEPT: {
+			const RealType multiplier = std::exp(realDelta);
+			for (size_t i = 0; i < K; ++i) {
+				fitted[i] = advanceProbability(fitted[i], multiplier);
+			}
+			break;
+		}
+	}
+
+	sparseLogisticExpXBetaDirty = true;
+	sparseLogisticXBetaDirty = true;
 }
 
 // TODO The following function is an example of a double-dispatch, rewrite without need for virtual function
@@ -1877,6 +2316,8 @@ void ModelSpecifics<BaseModel,RealType>::incrementNumeratorForGradientImpl(int i
 
 template <class BaseModel,typename RealType>
 void ModelSpecifics<BaseModel,RealType>::updateXBeta(double delta, int index, bool useWeights) {
+	syncSparseLogisticState();
+	sparseLogisticStateReady = false;
 
 #ifdef CYCLOPS_DEBUG_TIMING
 #ifndef CYCLOPS_DEBUG_TIMING_LOW

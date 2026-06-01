@@ -696,10 +696,11 @@ void CyclicCoordinateDescent::update(const ModeFindingArguments& arguments) {
 
 
 	while (!done) {
- 	    if (arguments.useKktSwindle && jointPrior->getSupportsKktSwindle()) {
+	    if (arguments.useKktSwindle && jointPrior->getSupportsKktSwindle()) {
 		    kktSwindle(arguments);
 	    } else {
-		    findMode(maxIterations, convergenceType, epsilon, algorthmType, qnQ, doItAll);
+		    findMode(maxIterations, convergenceType, epsilon, algorthmType, qnQ, doItAll,
+					arguments.logisticKernel);
 	    }
 	    ++count;
 
@@ -728,7 +729,8 @@ void CyclicCoordinateDescent::findMode(Iterator begin, Iterator end,
  	std::for_each(begin, end, [this] (ScoreTuple& tuple) {
  		fixBeta[std::get<0>(tuple)] = false;
  	});
-	findMode(maxIterations, convergenceType, epsilon, algorithmType, qnQ, doItAll);
+	findMode(maxIterations, convergenceType, epsilon, algorithmType, qnQ, doItAll,
+			LogisticKernelType::LEGACY);
     // fixBeta is no longer valid
 }
 
@@ -1036,7 +1038,8 @@ void CyclicCoordinateDescent::findMode(
 		int convergenceType,
 		double epsilon,
 		AlgorithmType algorithmType,
-		int qnQ, bool doItAll
+		int qnQ, bool doItAll,
+		LogisticKernelType logisticKernel
 		) {
 
 	if (convergenceType < GRADIENT || convergenceType > ZHANG_OLES) {
@@ -1073,6 +1076,17 @@ void CyclicCoordinateDescent::findMode(
 	if (!sufficientStatisticsKnown) {
 		computeRemainingStatistics(true, 0); // TODO Check index?
 		sufficientStatisticsKnown = true;
+	}
+
+	const LogisticKernelType effectiveLogisticKernel =
+			(logisticKernel == LogisticKernelType::SPARSE_RESIDUAL
+			 && algorithmType == AlgorithmType::CCD
+			 && !usingGPU
+			 && !usingCUDA)
+			? LogisticKernelType::SPARSE_RESIDUAL
+			: LogisticKernelType::LEGACY;
+	if (effectiveLogisticKernel == LogisticKernelType::SPARSE_RESIDUAL) {
+		modelSpecifics.refreshSparseLogisticState(useCrossValidation);
 	}
 
 	resetBounds();
@@ -1124,7 +1138,7 @@ void CyclicCoordinateDescent::findMode(
 	}
 
 // <<<<<<< HEAD
-	auto cycle = [this,&iteration,algorithmType,&allDelta,&doItAll] {
+	auto cycle = [this,&iteration,algorithmType,&allDelta,&doItAll,effectiveLogisticKernel] {
 // =======
 // 	auto cycle = [this,&lastObjFunc,&lastObjFuncVec,&iteration,algorithmType,&allDelta,&doItAll] {
 // >>>>>>> jni
@@ -1208,12 +1222,12 @@ void CyclicCoordinateDescent::findMode(
 	    		for(int index = 0; index < J; index++) {
 
 	    			if (!fixBeta[index]) {
-						double delta = ccdUpdateBeta(index);
+						double delta = ccdUpdateBeta(index, effectiveLogisticKernel);
 						delta = applyBounds(delta, index);
 					//	std::cout << "index: " << index << " delta: " << delta << "\n";
 						if (delta != 0.0) {
 							sufficientStatisticsKnown = false;
-							updateSufficientStatistics(delta, index);
+							updateSufficientStatistics(delta, index, effectiveLogisticKernel);
 						}
 				}
 	    			log(index);
@@ -1452,6 +1466,20 @@ void CyclicCoordinateDescent::computeGradientAndHessian(int index, double *ograd
 	modelSpecifics.computeGradientAndHessian(index, ogradient, ohessian, useCrossValidation);
 }
 
+void CyclicCoordinateDescent::computeGradientAndHessianForKernel(
+		int index,
+		priors::GradientHessian& gh,
+		const LogisticKernelType logisticKernel) {
+	if (logisticKernel == LogisticKernelType::SPARSE_RESIDUAL) {
+		modelSpecifics.computeSparseLogisticGradientAndHessian(
+				index, &gh.first, &gh.second, useCrossValidation);
+	} else {
+		modelSpecifics.syncSparseLogisticState();
+		computeNumeratorForGradient(index);
+		computeGradientAndHessian(index, &gh.first, &gh.second);
+	}
+}
+
 void CyclicCoordinateDescent::computeNumeratorForGradient(int index) {
 	// Delegate
 	modelSpecifics.computeNumeratorForGradient(index, useCrossValidation);
@@ -1632,6 +1660,10 @@ void CyclicCoordinateDescent::mmUpdateAllBeta(std::vector<double>& delta,
 
 
 double CyclicCoordinateDescent::ccdUpdateBeta(int index) {
+	return ccdUpdateBeta(index, LogisticKernelType::LEGACY);
+}
+
+double CyclicCoordinateDescent::ccdUpdateBeta(int index, const LogisticKernelType logisticKernel) {
 
 	if (!sufficientStatisticsKnown) {
 	    std::ostringstream stream;
@@ -1639,10 +1671,8 @@ double CyclicCoordinateDescent::ccdUpdateBeta(int index) {
 		error->throwError(stream);
 	}
 
-	computeNumeratorForGradient(index);
-
 	priors::GradientHessian gh;
-	computeGradientAndHessian(index, &gh.first, &gh.second);
+	computeGradientAndHessianForKernel(index, gh, logisticKernel);
 
 //	std::cout << "index: " << index << " grad: " << gh.first << " hess: " << gh.second << "\n";
 
@@ -1722,6 +1752,17 @@ void CyclicCoordinateDescent::updateXBeta(double delta, int index) {
 
 void CyclicCoordinateDescent::updateSufficientStatistics(double delta, int index) {
 	updateXBeta(delta, index);
+	sufficientStatisticsKnown = true;
+}
+
+void CyclicCoordinateDescent::updateSufficientStatistics(
+		double delta, int index, const LogisticKernelType logisticKernel) {
+	if (logisticKernel == LogisticKernelType::SPARSE_RESIDUAL) {
+		hBeta[index] += delta;
+		modelSpecifics.updateSparseLogisticState(delta, index, useCrossValidation);
+	} else {
+		updateXBeta(delta, index);
+	}
 	sufficientStatisticsKnown = true;
 }
 

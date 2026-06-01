@@ -81,6 +81,17 @@ public:
 	void computeGradientAndHessian(int index, double *ogradient,
 			double *ohessian,  bool useWeights);
 
+	bool supportsSparseLogisticKernel(int index, bool useWeights) const;
+
+	void refreshSparseLogisticState(bool useWeights);
+
+	void computeSparseLogisticGradientAndHessian(int index, double *ogradient,
+			double *ohessian, bool useWeights);
+
+	void updateSparseLogisticState(double realDelta, int index, bool useWeights);
+
+	void syncSparseLogisticState();
+
 	void computeThirdDerivative(int index, double *othird, bool useWeights);
 
 	virtual void computeMMGradientAndHessian(
@@ -182,6 +193,20 @@ protected:
 
     RealVector hXjY;
     RealVector hXjX;
+    RealVector sparseLogisticFitted;
+    std::vector<int> sparseLogisticCaseRows;
+    std::vector<FormatType> sparseLogisticColumnFormat;
+    struct SparseLogisticWeightedColumnView {
+        std::vector<int> rows;
+        RealVector values;
+    };
+    std::vector<int> sparseLogisticWeightedRows;
+    std::vector<SparseLogisticWeightedColumnView> sparseLogisticWeightedColumnViews;
+    bool sparseLogisticWeightedColumnViewsReady;
+    bool sparseLogisticWeightedRowsHaveUnitWeight;
+    bool sparseLogisticStateReady;
+    bool sparseLogisticXBetaDirty;
+    bool sparseLogisticExpXBetaDirty;
     RealType logLikelihoodFixedTerm;
 
     typedef bsccs::shared_ptr<CompressedDataColumn<RealType>> CDCPtr;
@@ -192,6 +217,13 @@ protected:
 
 	template <typename IteratorType>
 	void axpy(RealType* y, const RealType alpha, const int index);
+
+	void ensureSparseLogisticColumnFormat();
+	void ensureSparseLogisticWeightedColumnViews();
+	void invalidateSparseLogisticWeightedColumnViews();
+	void materializeSparseLogisticExpXBeta();
+	RealType sparseLogisticLogOdds(RealType probability) const;
+	RealType sparseLogisticLogDenominator(RealType probability) const;
 
 	void computeNumeratorForGradient(int index, bool useWeights);
 

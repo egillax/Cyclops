@@ -258,7 +258,8 @@ protected:
 	void computeFixedTermsInGradientAndHessian(void);
 
 	void findMode(const int maxIterations, const int convergenceType, const double epsilon,
-               const AlgorithmType algorithmType, const int qQN, const bool doItAll);
+               const AlgorithmType algorithmType, const int qQN, const bool doItAll,
+			   const LogisticKernelType logisticKernel);
 
 	template <typename Iterator>
 	void findMode(Iterator begin, Iterator end,
@@ -273,6 +274,8 @@ protected:
 	void computeSufficientStatistics(void);
 
 	void updateSufficientStatistics(double delta, int index);
+
+	void updateSufficientStatistics(double delta, int index, const LogisticKernelType logisticKernel);
 
 	void computeNumeratorForGradient(int index);
 
@@ -299,6 +302,9 @@ protected:
 			double *gradient,
 			double *hessian);
 
+	void computeGradientAndHessianForKernel(int index, priors::GradientHessian& gh,
+			const LogisticKernelType logisticKernel);
+
 	template <class IteratorType>
 	void computeGradientAndHessianImpl(
 			int index,
@@ -322,6 +328,8 @@ protected:
 	void checkAllLazyFlags(void);
 
 	double ccdUpdateBeta(int index);
+
+	double ccdUpdateBeta(int index, const LogisticKernelType logisticKernel);
 
 
 	void mmUpdateAllBeta(std::vector<double>& allDelta,

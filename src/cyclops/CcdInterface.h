@@ -78,6 +78,7 @@ struct ModeFindingArguments {
 	int convergenceType;
 	bool useKktSwindle;
 	int swindleMultipler;
+	LogisticKernelType logisticKernel;
 	double initialBound;
 	int maxBoundCount;
 	bool doItAll;
@@ -90,8 +91,10 @@ struct ModeFindingArguments {
 		convergenceType(GRADIENT),
 		useKktSwindle(false),
 		swindleMultipler(10),
+		logisticKernel(LogisticKernelType::SPARSE_RESIDUAL),
 		initialBound(2.0),
 		maxBoundCount(5),
+		doItAll(true),
 		algorithmType(AlgorithmType::CCD)
 	    { }
 };

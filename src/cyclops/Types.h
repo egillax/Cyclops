@@ -176,6 +176,12 @@ enum class SelectorType {
 	SIZE_OF_ENUM // Keep at end
 };
 
+enum class LogisticKernelType {
+	LEGACY,
+	SPARSE_RESIDUAL,
+	SIZE_OF_ENUM // Keep at end
+};
+
 enum class NormalizationType {
     STANDARD_DEVIATION,
     MAX,

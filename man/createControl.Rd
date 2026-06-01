@@ -27,7 +27,8 @@ createControl(
   maxBoundCount = 5,
   algorithm = "ccd",
   doItAll = TRUE,
-  syncCV = FALSE
+  syncCV = FALSE,
+  logisticKernel = "auto"
 )
 }
 \arguments{
@@ -81,9 +82,9 @@ the average number of rows per stratum is smaller than the number of strata.}
 
 \item{doItAll}{Currently unused}
 
-\item{syncCV}{Currently unused
+\item{syncCV}{Currently unused}
 
-Todo: Describe convegence types}
+\item{logisticKernel}{String: logistic CCD kernel (\code{"auto"}, \code{"sparse-residual"}, \code{"legacy"})}
 }
 \value{
 A Cyclops control object of class inheriting from \code{"cyclopsControl"} for use with \code{\link{fitCyclopsModel}}.

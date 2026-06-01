@@ -68,6 +68,25 @@ public:
 	virtual void computeGradientAndHessian(int index, double *ogradient,
 			double *ohessian, bool useWeights) = 0; // pure virtual
 
+	virtual bool supportsSparseLogisticKernel(int index, bool useWeights) const {
+		return false;
+	}
+
+	virtual void refreshSparseLogisticState(bool useWeights) {
+	}
+
+	virtual void computeSparseLogisticGradientAndHessian(int index, double *ogradient,
+			double *ohessian, bool useWeights) {
+		computeGradientAndHessian(index, ogradient, ohessian, useWeights);
+	}
+
+	virtual void updateSparseLogisticState(double realDelta, int index, bool useWeights) {
+		updateXBeta(realDelta, index, useWeights);
+	}
+
+	virtual void syncSparseLogisticState() {
+	}
+
 	virtual void computeThirdDerivative(int index, double *othird, bool useWeights) = 0; // pure virtual
 
 	virtual void computeMMGradientAndHessian(std::vector<GradientHessian>& gh, const std::vector<bool>& fixBeta, bool useWeights) = 0; // pure virtual
