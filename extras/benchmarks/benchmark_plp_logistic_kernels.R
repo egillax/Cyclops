@@ -1,5 +1,14 @@
 #!/usr/bin/env Rscript
 
+configure_andromeda <- function() {
+  andromeda_temp <- path.expand(Sys.getenv("ANDROMEDA_TEMP", "~/andromeda_tmp"))
+  dir.create(andromeda_temp, recursive = TRUE, showWarnings = FALSE)
+
+  options(andromedaMemoryLimit = as.numeric(Sys.getenv("ANDROMEDA_MEMORY_GB", "40")))
+  options(andromedaTempFolder = andromeda_temp)
+  options(andromedaThreads = as.integer(Sys.getenv("ANDROMEDA_THREADS", "8")))
+}
+
 usage <- function(status = 0) {
   cat(
     "Usage:\n",
@@ -118,10 +127,13 @@ load_rds_input <- function(path) {
   obj
 }
 
-load_plp_input <- function(path, outcome_id) {
-  require_package("Matrix")
+load_plp_input <- function(path, outcome_id, sample_size, seed) {
   require_package("dplyr")
+  require_package("Andromeda")
+  require_package("Cyclops")
   require_package("PatientLevelPrediction")
+
+  configure_andromeda()
 
   plp_data <- if (dir.exists(path)) {
     PatientLevelPrediction::loadPlpData(path)
@@ -159,25 +171,42 @@ load_plp_input <- function(path, outcome_id) {
   } else {
     stop("Population must contain outcomeCount or y")
   }
+  if (!is.na(sample_size) && sample_size < length(y)) {
+    set.seed(seed)
+    rows <- sort(sample(seq_along(y), sample_size))
+    population <- population[rows, , drop = FALSE]
+    y <- y[rows]
+  }
 
-  row_map <- data.frame(rowId = population$rowId,
-                        matrixRowId = seq_len(nrow(population)))
-  covariates <- plp_data$covariateData$covariates
-  covariates <- dplyr::inner_join(covariates, row_map, by = "rowId", copy = TRUE)
-  covariates <- dplyr::select(covariates, matrixRowId, covariateId, covariateValue)
-  covariates <- dplyr::collect(covariates)
+  outcomes <- data.frame(rowId = population$rowId, y = y)
+  andromeda <- Andromeda::andromeda(outcomes = outcomes)
+  covariates <- plp_data$covariateData$covariates |>
+    dplyr::inner_join(
+      andromeda$outcomes |> dplyr::select(rowId),
+      by = "rowId",
+      copy = TRUE
+    ) |>
+    dplyr::select(rowId, covariateId, covariateValue)
 
-  feature_ids <- sort(unique(covariates$covariateId))
-  col_id <- match(covariates$covariateId, feature_ids)
-  x <- Matrix::sparseMatrix(
-    i = covariates$matrixRowId,
-    j = col_id,
-    x = as.numeric(covariates$covariateValue),
-    dims = c(length(y), length(feature_ids))
+  cyclops_data <- Cyclops::convertToCyclopsData(
+    outcomes = andromeda$outcomes,
+    covariates = covariates,
+    modelType = "lr",
+    addIntercept = TRUE,
+    checkRowIds = FALSE,
+    quiet = TRUE
   )
-  x <- as(x, "dgCMatrix")
 
-  list(x = x, y = y, source = "plp-data", covariateIds = feature_ids)
+  list(
+    cyclops_data = cyclops_data,
+    x = NULL,
+    y = y,
+    rows = length(y),
+    features = Cyclops::getNumberOfCovariates(cyclops_data) - 1L,
+    nnz = NA_integer_,
+    source = "plp-data",
+    andromeda = andromeda
+  )
 }
 
 sample_rows <- function(data, n, seed) {
@@ -188,6 +217,9 @@ sample_rows <- function(data, n, seed) {
   rows <- sort(sample(seq_along(data$y), n))
   data$x <- data$x[rows, , drop = FALSE]
   data$y <- data$y[rows]
+  data$rows <- nrow(data$x)
+  data$features <- ncol(data$x)
+  data$nnz <- length(data$x@x)
   data
 }
 
@@ -216,6 +248,9 @@ stable_log1pexp <- function(eta) {
 
 compute_metrics <- function(x, y, beta, variance) {
   require_package("Matrix")
+  if (is.null(x)) {
+    return(list(log_likelihood_check = NA_real_, objective_check = NA_real_))
+  }
   if (is.null(beta) || any(is.na(beta))) {
     return(list(log_likelihood_check = NA_real_, objective_check = NA_real_))
   }
@@ -245,7 +280,11 @@ safe_field <- function(obj, name, default = NA) {
   default
 }
 
-fit_one <- function(cyclops_data, x, y, kernel, repetition, args) {
+fit_one <- function(data, kernel, repetition, args) {
+  cyclops_data <- data$cyclops_data
+  x <- data$x
+  y <- data$y
+  n_covariates <- Cyclops::getNumberOfCovariates(cyclops_data)
   use_cv <- identical(args$mode, "cv")
   prior <- Cyclops::createPrior(
     "laplace",
@@ -284,19 +323,19 @@ fit_one <- function(cyclops_data, x, y, kernel, repetition, args) {
 
   beta <- tryCatch(
     stats::coef(fit, ignoreConvergence = TRUE),
-    error = function(e) rep(NA_real_, ncol(x) + 1L)
+    error = function(e) rep(NA_real_, n_covariates)
   )
   variance <- as.numeric(safe_field(fit, "variance", args$variance))[1L]
   checked <- compute_metrics(x, y, beta, variance)
-  penalized_beta <- if (length(beta) == ncol(x) + 1L) beta[-1L] else beta
+  penalized_beta <- if (length(beta) == n_covariates) beta[-1L] else beta
 
   data.frame(
     kernel = kernel,
     repetition = repetition,
     mode = args$mode,
-    rows = nrow(x),
-    features = ncol(x),
-    nnz = length(x@x),
+    rows = data$rows,
+    features = data$features,
+    nnz = data$nnz,
     elapsed_sec = as.numeric(elapsed["elapsed"]),
     user_sec = as.numeric(elapsed["user.self"]),
     system_sec = as.numeric(elapsed["sys.self"]),
@@ -350,16 +389,21 @@ main <- function() {
   data <- if (!is.na(args$matrix_rds)) {
     load_rds_input(args$matrix_rds)
   } else {
-    load_plp_input(args$plp_data, args$outcome_id)
+    load_plp_input(args$plp_data, args$outcome_id, args$sample_size, args$seed)
   }
-  data <- sample_rows(data, args$sample_size, args$seed)
+  if (is.null(data$cyclops_data)) {
+    data <- sample_rows(data, args$sample_size, args$seed)
+    data$rows <- nrow(data$x)
+    data$features <- ncol(data$x)
+    data$nnz <- length(data$x@x)
+    cat("Building Cyclops data...\n")
+    data$cyclops_data <- make_cyclops_data(data$x, data$y)
+  }
 
-  cat("Loaded data: rows=", nrow(data$x),
-      " features=", ncol(data$x),
-      " nnz=", length(data$x@x),
+  cat("Loaded data: rows=", data$rows,
+      " features=", data$features,
+      " nnz=", data$nnz,
       " outcomes=", sum(data$y != 0), "\n", sep = "")
-  cat("Building Cyclops data...\n")
-  cyclops_data <- make_cyclops_data(data$x, data$y)
 
   kernels <- trimws(strsplit(args$kernels, ",", fixed = TRUE)[[1L]])
   results <- list()
@@ -367,9 +411,7 @@ main <- function() {
     for (kernel in kernels) {
       cat("Fitting kernel=", kernel, " repetition=", rep, "...\n", sep = "")
       results[[length(results) + 1L]] <- fit_one(
-        cyclops_data = cyclops_data,
-        x = data$x,
-        y = data$y,
+        data = data,
         kernel = kernel,
         repetition = rep,
         args = args
