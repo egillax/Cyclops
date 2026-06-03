@@ -179,6 +179,8 @@ load_plp_input <- function(path, outcome_id, sample_size, seed) {
   }
 
   outcomes <- data.frame(rowId = population$rowId, y = y)
+  outcomes <- outcomes[order(outcomes$rowId), , drop = FALSE]
+  y <- outcomes$y
   andromeda <- Andromeda::andromeda(outcomes = outcomes)
   covariates <- plp_data$covariateData$covariates |>
     dplyr::inner_join(
@@ -187,6 +189,12 @@ load_plp_input <- function(path, outcome_id, sample_size, seed) {
       copy = TRUE
     ) |>
     dplyr::select(rowId, covariateId, covariateValue)
+  nnz <- tryCatch(
+    covariates |>
+      dplyr::summarise(nnz = dplyr::n()) |>
+      dplyr::pull(nnz),
+    error = function(e) NA_integer_
+  )
 
   cyclops_data <- Cyclops::convertToCyclopsData(
     outcomes = andromeda$outcomes,
@@ -203,7 +211,7 @@ load_plp_input <- function(path, outcome_id, sample_size, seed) {
     y = y,
     rows = length(y),
     features = Cyclops::getNumberOfCovariates(cyclops_data) - 1L,
-    nnz = NA_integer_,
+    nnz = as.numeric(nnz)[1L],
     source = "plp-data",
     andromeda = andromeda
   )
@@ -248,14 +256,15 @@ stable_log1pexp <- function(eta) {
 
 compute_metrics <- function(x, y, beta, variance) {
   require_package("Matrix")
-  if (is.null(x)) {
+  if (is.null(beta) || all(is.na(beta))) {
     return(list(log_likelihood_check = NA_real_, objective_check = NA_real_))
   }
-  if (is.null(beta) || any(is.na(beta))) {
+  if (is.null(x)) {
     return(list(log_likelihood_check = NA_real_, objective_check = NA_real_))
   }
 
   beta <- as.numeric(beta)
+  beta[is.na(beta)] <- 0
   if (length(beta) == ncol(x) + 1L) {
     eta <- beta[1L] + as.numeric(x %*% beta[-1L])
   } else if (length(beta) == ncol(x)) {
@@ -266,6 +275,32 @@ compute_metrics <- function(x, y, beta, variance) {
   log_likelihood <- sum(y * eta - stable_log1pexp(eta))
   lambda <- sqrt(2 / variance)
   penalized_beta <- if (length(beta) == ncol(x) + 1L) beta[-1L] else beta
+  objective <- log_likelihood - lambda * sum(abs(penalized_beta))
+  list(
+    log_likelihood_check = log_likelihood,
+    objective_check = objective
+  )
+}
+
+compute_prediction_metrics <- function(fit, y, beta, variance) {
+  if (is.null(beta) || all(is.na(beta))) {
+    return(list(log_likelihood_check = NA_real_, objective_check = NA_real_))
+  }
+  beta <- as.numeric(beta)
+  beta[is.na(beta)] <- 0
+  prediction <- tryCatch(
+    as.numeric(stats::predict(fit)),
+    error = function(e) NA_real_
+  )
+  if (length(prediction) != length(y) || any(is.na(prediction))) {
+    return(list(log_likelihood_check = NA_real_, objective_check = NA_real_))
+  }
+
+  eps <- .Machine$double.eps
+  prediction <- pmin(pmax(prediction, eps), 1 - eps)
+  log_likelihood <- sum(y * log(prediction) + (1 - y) * log1p(-prediction))
+  lambda <- sqrt(2 / variance)
+  penalized_beta <- if (length(beta) > 1L) beta[-1L] else beta
   objective <- log_likelihood - lambda * sum(abs(penalized_beta))
   list(
     log_likelihood_check = log_likelihood,
@@ -326,7 +361,7 @@ fit_one <- function(data, kernel, repetition, args) {
     error = function(e) rep(NA_real_, n_covariates)
   )
   variance <- as.numeric(safe_field(fit, "variance", args$variance))[1L]
-  checked <- compute_metrics(x, y, beta, variance)
+  checked <- compute_prediction_metrics(fit, y, beta, variance)
   penalized_beta <- if (length(beta) == n_covariates) beta[-1L] else beta
 
   data.frame(
