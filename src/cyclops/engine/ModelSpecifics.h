@@ -14,6 +14,7 @@
 #include <stdexcept>
 #include <thread>
 #include <complex>
+#include <chrono>
 
 //#define CYCLOPS_DEBUG_TIMING
 //#define CYCLOPS_DEBUG_TIMING_GPU_COX
@@ -88,9 +89,34 @@ public:
 	void computeSparseLogisticGradientAndHessian(int index, double *ogradient,
 			double *ohessian, bool useWeights);
 
-	void updateSparseLogisticState(double realDelta, int index, bool useWeights);
+	double updateSparseLogisticState(double realDelta, int index, bool useWeights);
+
+	size_t getSparseLogisticColumnScanSize(int index, bool useWeights);
+
+	SparseLogisticPerformanceCounters getSparseLogisticPerformanceCounters() const;
+
+	void resetSparseLogisticPerformanceCounters();
+
+	void addSparseLogisticKktScan(size_t nnz, double seconds);
+
+	GapSafeDiagnostic computeSparseLogisticGapSafeDiagnostic(
+			const std::vector<double>& boundaries,
+			const std::vector<bool>& fixedBeta,
+			const std::vector<double>& beta,
+			double penalty,
+			bool useWeights);
 
 	void syncSparseLogisticState();
+
+	bool initializeXBetaFromRowSubset(
+			const std::vector<double>& sourceXBeta,
+			const std::vector<int>& keptRows);
+
+	bool initializeSparseLogisticStateFromRowSubset(
+			const AbstractModelSpecifics& source,
+			const std::vector<int>& keptRows);
+
+	bool hasSparseLogisticStateReady() const;
 
 	void computeThirdDerivative(int index, double *othird, bool useWeights);
 
@@ -207,6 +233,8 @@ protected:
     bool sparseLogisticStateReady;
     bool sparseLogisticXBetaDirty;
     bool sparseLogisticExpXBetaDirty;
+    bool sparseIndicesReady;
+    SparseLogisticPerformanceCounters sparseLogisticPerformanceCounters;
     RealType logLikelihoodFixedTerm;
 
     typedef bsccs::shared_ptr<CompressedDataColumn<RealType>> CDCPtr;
@@ -226,6 +254,7 @@ protected:
 	RealType sparseLogisticLogDenominator(RealType probability) const;
 
 	void computeNumeratorForGradient(int index, bool useWeights);
+	void ensureSparseIndices();
 
 	void computeFisherInformation(int indexOne, int indexTwo, double *oinfo, bool useWeights);
 

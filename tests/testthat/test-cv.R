@@ -3,6 +3,148 @@ library("testthat")
 context("test-cv.R")
 suppressWarnings(RNGversion("3.5.0"))
 
+test_that("Sparse logistic CV polish controls are validated", {
+    control <- createControl(
+        logisticKernel = "sparse-residual-active",
+        sparseConvergenceType = "fitted-change",
+        sparseActiveKktTolerance = 0.15,
+        sparseActiveKktMovementTolerance = 1e-9,
+        cvPolishPolicy = "selective",
+        cvPolishTolerance = 1e-8,
+        cvPolishInitialCandidates = 4,
+        cvPolishStopProposal = FALSE
+    )
+
+    expect_equal(control$sparseConvergenceType, "fitted-change")
+    expect_equal(control$sparseActiveKktTolerance, 0.15)
+    expect_equal(control$cvPolishPolicy, "selective")
+    expect_equal(control$cvPolishTolerance, 1e-8)
+    expect_equal(control$cvPolishInitialCandidates, 4)
+    expect_false(control$cvPolishStopProposal)
+    expect_equal(
+        createControl(
+            cvPolishPolicy = "selective",
+            cvPolishTolerance = 1e-8
+        )$cvPolishInitialCandidates,
+        1
+    )
+    expect_equal(
+        createControl(logisticKernel = "sparse-residual-active-strong")$logisticKernel,
+        "sparse-residual-active-strong"
+    )
+
+    expect_error(
+        createControl(cvPolishPolicy = "selective"),
+        "cvPolishTolerance > 0"
+    )
+    expect_error(
+        createControl(sparseConvergenceType = "unknown"),
+        "sparseConvergenceType"
+    )
+    expect_error(
+        createControl(cvPolishInitialCandidates = -1),
+        "cvPolishInitialCandidates"
+    )
+    expect_error(
+        createControl(cvPolishInitialCandidates = c(1, 2)),
+        "cvPolishInitialCandidates"
+    )
+    expect_error(
+        createControl(cvPolishInitialCandidates = NA_real_),
+        "cvPolishInitialCandidates"
+    )
+    expect_error(
+        createControl(cvPolishInitialCandidates = 1.5),
+        "cvPolishInitialCandidates"
+    )
+    expect_error(
+        createControl(cvPolishStopProposal = c(TRUE, FALSE)),
+        "cvPolishStopProposal"
+    )
+    expect_error(
+        createControl(cvPolishStopProposal = NA),
+        "cvPolishStopProposal"
+    )
+})
+
+test_that("Fold-local sparse logistic CV matches full-data scoring", {
+    skip_on_cran()
+    suppressWarnings(RNGversion("3.5.0"))
+    seed <- 123
+    set.seed(seed)
+
+    data <- simulateCyclopsData(
+        nstrata = 1,
+        nrows = 600,
+        ncovars = 20,
+        eCovarsPerRow = 2,
+        effectSizeSd = 1.5,
+        model = "logistic"
+    )
+    cyclopsData <- convertToCyclopsData(
+        data$outcomes,
+        data$covariates,
+        modelType = "lr",
+        addIntercept = TRUE
+    )
+    prior <- createPrior("laplace", exclude = c(0), useCrossValidation = TRUE)
+    control <- createControl(
+        noiseLevel = "quiet",
+        cvType = "grid",
+        fold = 3,
+        cvRepetitions = 1,
+        seed = seed,
+        lowerLimit = 0.01,
+        upperLimit = 10,
+        gridSteps = 4,
+        threads = 3,
+        maxIterations = 2000,
+        tolerance = 1e-8,
+        logisticKernel = "sparse-residual-active"
+    )
+
+    oldFoldLocal <- Sys.getenv("CYCLOPS_FOLD_LOCAL_CV", unset = NA_character_)
+    on.exit({
+        if (is.na(oldFoldLocal)) {
+            Sys.unsetenv("CYCLOPS_FOLD_LOCAL_CV")
+        } else {
+            Sys.setenv(CYCLOPS_FOLD_LOCAL_CV = oldFoldLocal)
+        }
+    }, add = TRUE)
+
+    Sys.unsetenv("CYCLOPS_FOLD_LOCAL_CV")
+    capture.output(
+        fullFit <- fitCyclopsModel(
+            cyclopsData,
+            prior = prior,
+            control = control,
+            forceNewObject = TRUE
+        )
+    )
+
+    Sys.setenv(CYCLOPS_FOLD_LOCAL_CV = "1")
+    capture.output(
+        foldLocalFit <- fitCyclopsModel(
+            cyclopsData,
+            prior = prior,
+            control = control,
+            forceNewObject = TRUE
+        )
+    )
+
+    fullCv <- Cyclops:::getCrossValidationInfo(fullFit)
+    foldLocalCv <- Cyclops:::getCrossValidationInfo(foldLocalFit)
+
+    expect_equal(foldLocalFit$variance, fullFit$variance, tolerance = 1e-12)
+    expect_equal(foldLocalCv$ordinate, fullCv$ordinate, tolerance = 1e-8)
+    expect_equal(foldLocalCv$point, fullCv$point, tolerance = 1e-12)
+    expect_equal(
+        coef(foldLocalFit, ignoreConvergence = TRUE),
+        coef(fullFit, ignoreConvergence = TRUE),
+        tolerance = 1e-8
+    )
+})
+
 # ### COX ERROR
 #
 # library(Cyclops)

@@ -778,11 +778,96 @@ List cyclopsModelData(SEXP pid, SEXP y, SEXP z, SEXP offs, SEXP dx, SEXP sx, SEX
 namespace bsccs {
 
 template <typename RealType>
+std::vector<RealType> compactRealVectorByRows(
+        const std::vector<RealType>& values,
+        const std::vector<int>& keptRows,
+        size_t sourceRows,
+        const char* name) {
+    std::vector<RealType> compact;
+    if (values.empty()) {
+        return compact;
+    }
+    if (values.size() != sourceRows) {
+        Rcpp::stop("Cannot compact %s: length does not match source row count", name);
+    }
+    compact.reserve(keptRows.size());
+    for (const auto row : keptRows) {
+        compact.push_back(values[row]);
+    }
+    return compact;
+}
+
+std::vector<int> compactPidVectorByRows(
+        const std::vector<int>& values,
+        const std::vector<int>& keptRows,
+        size_t sourceRows) {
+    std::vector<int> compact;
+    if (values.empty()) {
+        return compact;
+    }
+    if (values.size() != sourceRows) {
+        Rcpp::stop("Cannot compact pid: length does not match source row count");
+    }
+    compact.reserve(keptRows.size());
+    for (const auto row : keptRows) {
+        compact.push_back(values[row]);
+    }
+    return compact;
+}
+
+template <typename RealType>
+void renumberPidVector(RcppModelData<RealType>& data) {
+    std::vector<int>& cpid = data.getPidVectorRef();
+
+    if (cpid.empty()) {
+        const auto nRows = data.getNumberOfRows();
+        for (size_t i = 0; i < nRows; ++i) {
+            cpid.push_back(static_cast<int>(i));
+        }
+        return;
+    }
+
+    int currentCase = 0;
+    int currentPID = cpid[0];
+    cpid[0] = currentCase;
+    for (size_t i = 1; i < cpid.size(); ++i) {
+        int nextPID = cpid[i];
+        if (nextPID != currentPID) {
+            currentCase++;
+            currentPID = nextPID;
+        }
+        cpid[i] = currentCase;
+    }
+}
+
+template <typename RealType>
 RcppModelData<RealType>::RcppModelData(
 			ModelType modelType,
 	        loggers::ProgressLoggerPtr log,
     	    loggers::ErrorHandlerPtr error
 ) : ModelData<RealType>(modelType, log, error) { }
+
+template <typename RealType>
+RcppModelData<RealType>::RcppModelData(
+        ModelType _modelType,
+        const IntVector& _pid,
+        const RealVector& _y,
+        const RealVector& _type,
+        const RealVector& _time,
+        int numTypes
+) : ModelData<RealType>(
+                _modelType,
+                _pid,
+                _y,
+                _type,
+                _time,
+                bsccs::make_shared<loggers::RcppProgressLogger>(),
+                bsccs::make_shared<loggers::RcppErrorHandler>()
+                ) {
+    nTypes = numTypes;
+    this->getX().nRows = y.size();
+    renumberPidVector(*this);
+}
 
 template <typename RealType>
 RcppModelData<RealType>::RcppModelData(
@@ -934,8 +1019,158 @@ RcppModelData<RealType>::RcppModelData(
 	        cpid[i] = currentCase;
     	}
         nPatients = currentCase + 1;
-    }
+	}
 }
+
+template <typename RealType>
+AbstractModelData* makeFoldLocalModelData(
+        const ModelData<RealType>& source,
+        const LogicalVector& keepRows,
+        size_t* copiedEntries) {
+    const auto sourceRows = source.getNumberOfRows();
+    if (static_cast<size_t>(keepRows.size()) != sourceRows) {
+        Rcpp::stop("keepRows length does not match Cyclops data row count");
+    }
+
+    std::vector<int> rowMap(sourceRows, -1);
+    std::vector<int> keptRows;
+    keptRows.reserve(sourceRows);
+
+    for (size_t row = 0; row < sourceRows; ++row) {
+        const int keep = keepRows[row];
+        if (LogicalVector::is_na(keep)) {
+            Rcpp::stop("keepRows cannot contain NA");
+        }
+        if (keep) {
+            rowMap[row] = static_cast<int>(keptRows.size());
+            keptRows.push_back(static_cast<int>(row));
+        }
+    }
+
+    const auto y = compactRealVectorByRows(source.getYVectorRef(), keptRows, sourceRows, "y");
+    const auto z = compactRealVectorByRows(source.getZVectorRef(), keptRows, sourceRows, "z");
+    const auto offs = compactRealVectorByRows(source.getTimeVectorRef(), keptRows, sourceRows, "time");
+    const auto pid = compactPidVectorByRows(source.getPidVectorSTL(), keptRows, sourceRows);
+
+    auto* target = new RcppModelData<RealType>(
+            source.getModelType(),
+            pid,
+            y,
+            z,
+            offs,
+            source.getNumberOfTypes());
+
+    auto& targetX = target->getX();
+    const auto& sourceX = source.getX();
+    size_t entries = 0;
+
+    for (size_t column = 0; column < source.getNumberOfCovariates(); ++column) {
+        const FormatType type = sourceX.getFormatType(static_cast<int>(column));
+
+        if (type == DENSE) {
+            const auto& sourceData = sourceX.getDataVectorSTL(static_cast<int>(column));
+            if (sourceData.size() != sourceRows) {
+                delete target;
+                Rcpp::stop("Cannot compact dense column: length does not match source row count");
+            }
+            auto compactData = make_shared<typename RcppModelData<RealType>::RealVector>();
+            compactData->reserve(keptRows.size());
+            for (const auto oldRow : keptRows) {
+                compactData->push_back(sourceData[oldRow]);
+            }
+            targetX.push_back(NULL, compactData, DENSE);
+        } else if (type == SPARSE) {
+            const auto& sourceRowsByColumn = sourceX.getCompressedColumnVectorSTL(static_cast<int>(column));
+            const auto& sourceData = sourceX.getDataVectorSTL(static_cast<int>(column));
+            if (sourceData.size() != sourceRowsByColumn.size()) {
+                delete target;
+                Rcpp::stop("Cannot compact sparse column: index and value lengths differ");
+            }
+            auto compactRows = make_shared<IntVector>();
+            auto compactData = make_shared<typename RcppModelData<RealType>::RealVector>();
+            compactRows->reserve(sourceRowsByColumn.size());
+            compactData->reserve(sourceData.size());
+            for (size_t k = 0; k < sourceRowsByColumn.size(); ++k) {
+                const int oldRow = sourceRowsByColumn[k];
+                const int newRow = rowMap[oldRow];
+                if (newRow >= 0) {
+                    compactRows->push_back(newRow);
+                    compactData->push_back(sourceData[k]);
+                }
+            }
+            entries += compactRows->size();
+            targetX.push_back(compactRows, compactData, SPARSE);
+        } else if (type == INDICATOR) {
+            const auto& sourceRowsByColumn = sourceX.getCompressedColumnVectorSTL(static_cast<int>(column));
+            auto compactRows = make_shared<IntVector>();
+            compactRows->reserve(sourceRowsByColumn.size());
+            for (const auto oldRow : sourceRowsByColumn) {
+                const int newRow = rowMap[oldRow];
+                if (newRow >= 0) {
+                    compactRows->push_back(newRow);
+                }
+            }
+            entries += compactRows->size();
+            targetX.push_back(compactRows, NULL, INDICATOR);
+        } else if (type == INTERCEPT) {
+            targetX.push_back(INTERCEPT);
+        } else {
+            delete target;
+            Rcpp::stop("Unknown Cyclops column type");
+        }
+
+        targetX.getColumn(targetX.getNumberOfColumns() - 1).add_label(
+                source.getColumnNumericalLabel(column));
+    }
+
+    target->setHasOffsetCovariate(source.getHasOffsetCovariate());
+    target->setHasInterceptCovariate(source.getHasInterceptCovariate());
+    target->setIsFinalized(source.getIsFinalized());
+
+    if (copiedEntries != nullptr) {
+        *copiedEntries = entries;
+    }
+
+    return target;
+}
+
+} // namespace bsccs
+
+// [[Rcpp::export(".cyclopsMakeFoldLocalData")]]
+List cyclopsMakeFoldLocalData(Environment object, LogicalVector keepRows) {
+    using namespace bsccs;
+
+    Timer timer;
+    XPtr<AbstractModelData> sourcePtr = parseEnvironmentForPtr(object);
+
+    AbstractModelData* foldData = nullptr;
+    size_t copiedEntries = 0;
+
+    if (sourcePtr->getPrecisionType() == PrecisionType::FP32) {
+        auto* source = dynamic_cast<ModelData<float>*>(sourcePtr.get());
+        if (source == nullptr) {
+            Rcpp::stop("Unsupported FP32 Cyclops data implementation");
+        }
+        foldData = makeFoldLocalModelData(*source, keepRows, &copiedEntries);
+    } else {
+        auto* source = dynamic_cast<ModelData<double>*>(sourcePtr.get());
+        if (source == nullptr) {
+            Rcpp::stop("Unsupported FP64 Cyclops data implementation");
+        }
+        foldData = makeFoldLocalModelData(*source, keepRows, &copiedEntries);
+    }
+
+    XPtr<AbstractModelData> ptr(foldData);
+    const double duration = timer();
+
+    return List::create(
+            Rcpp::Named("data") = ptr,
+            Rcpp::Named("timeLoad") = duration,
+            Rcpp::Named("rows") = static_cast<int>(ptr->getNumberOfRows()),
+            Rcpp::Named("entries") = static_cast<double>(copiedEntries));
+}
+
+namespace bsccs {
 
 // template <typename RealType>
 // double RcppModelData<RealType>::sum(const IdType covariate, int power) {

@@ -63,6 +63,15 @@ public:
 			);
 
 	RcppModelData(
+            ModelType modelType,
+			const IntVector& pid,
+			const RealVector& y,
+			const RealVector& z,
+			const RealVector& offs,
+            int numTypes = 1
+			);
+
+	RcppModelData(
 			ModelType modelType,
 	        loggers::ProgressLoggerPtr log,
     	    loggers::ErrorHandlerPtr error

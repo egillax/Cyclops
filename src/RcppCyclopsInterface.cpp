@@ -7,6 +7,8 @@
 #include <sstream>
 #include <vector>
 #include <map>
+#include <algorithm>
+#include <limits>
 #include "Timing.h"
 
 #include "Rcpp.h"
@@ -26,29 +28,95 @@ using namespace Rcpp;
 
 // // [[Rcpp::export("test")]]
 // size_t ccdTest(SEXP exp) {
-// 	if (Rf_isNull(exp)) {
-// 		return 0;
-// 	}
-// 	std::vector<std::string> strings = as<std::vector<std::string> >(exp);
-// 	return strings.size();
+//	if (Rf_isNull(exp)) {
+//		return 0;
+//	}
+//	std::vector<std::string> strings = as<std::vector<std::string> >(exp);
+//	return strings.size();
 // }
+
+// [[Rcpp::export(".cyclopsCompactRowsDgCMatrix")]]
+S4 cyclopsCompactRowsDgCMatrix(S4 matrix, LogicalVector keepRows) {
+	IntegerVector dim = matrix.slot("Dim");
+	if (dim.size() != 2) {
+		stop("Expected matrix Dim slot of length 2");
+	}
+	const int nRows = dim[0];
+	const int nCols = dim[1];
+	if (keepRows.size() != nRows) {
+		stop("keepRows length must match matrix row count");
+	}
+	IntegerVector oldI = matrix.slot("i");
+	IntegerVector oldP = matrix.slot("p");
+	NumericVector oldX = matrix.slot("x");
+	if (oldP.size() != nCols + 1) {
+		stop("Invalid dgCMatrix p slot length");
+	}
+
+	std::vector<int> rowMap(nRows, -1);
+	int nKeep = 0;
+	for (int row = 0; row < nRows; ++row) {
+		if (keepRows[row] == TRUE) {
+			rowMap[row] = nKeep++;
+		}
+	}
+
+	IntegerVector newP(nCols + 1);
+	size_t newNnz = 0;
+	for (int col = 0; col < nCols; ++col) {
+		newP[col] = static_cast<int>(newNnz);
+		for (int pos = oldP[col]; pos < oldP[col + 1]; ++pos) {
+			const int mapped = rowMap[oldI[pos]];
+			if (mapped >= 0) {
+				++newNnz;
+			}
+		}
+		if (newNnz > static_cast<size_t>(std::numeric_limits<int>::max())) {
+			stop("Compacted matrix has too many nonzero entries for dgCMatrix p slot");
+		}
+	}
+	newP[nCols] = static_cast<int>(newNnz);
+
+	IntegerVector newI(newNnz);
+	NumericVector newX(newNnz);
+	size_t out = 0;
+	for (int col = 0; col < nCols; ++col) {
+		for (int pos = oldP[col]; pos < oldP[col + 1]; ++pos) {
+			const int mapped = rowMap[oldI[pos]];
+			if (mapped >= 0) {
+				newI[out] = mapped;
+				newX[out] = oldX[pos];
+				++out;
+			}
+		}
+	}
+
+	S4 result("dgCMatrix");
+	result.slot("i") = newI;
+	result.slot("p") = newP;
+	result.slot("x") = newX;
+	result.slot("Dim") = IntegerVector::create(nKeep, nCols);
+	result.slot("Dimnames") = List::create(R_NilValue, R_NilValue);
+	result.slot("factors") = List::create();
+	return result;
+}
 
 
 namespace bsccs {
 
  static std::map<ModelType, std::string> modelTypeNames = {
- 	{ModelType::NORMAL, "ls"},
- 	{ModelType::POISSON, "pr"},
- 	{ModelType::LOGISTIC, "lr"},
- 	{ModelType::CONDITIONAL_LOGISTIC, "clr"},
- 	{ModelType::EFRON_CONDITIONAL_LOGISTIC, "clr_efron"},
- 	{ModelType::TIED_CONDITIONAL_LOGISTIC, "clr_exact"},
- 	{ModelType::CONDITIONAL_POISSON, "cpr"},
- 	{ModelType::SELF_CONTROLLED_MODEL, "sccs"},
- 	{ModelType::COX, "cox"},
- 	{ModelType::COX_RAW, "cox_raw"},
+	{ModelType::NORMAL, "ls"},
+	{ModelType::POISSON, "pr"},
+	{ModelType::LOGISTIC, "lr"},
+	{ModelType::CONDITIONAL_LOGISTIC, "clr"},
+	{ModelType::EFRON_CONDITIONAL_LOGISTIC, "clr_efron"},
+	{ModelType::TIED_CONDITIONAL_LOGISTIC, "clr_exact"},
+	{ModelType::CONDITIONAL_POISSON, "cpr"},
+	{ModelType::SELF_CONTROLLED_MODEL, "sccs"},
+	{ModelType::COX, "cox"},
+	{ModelType::COX_RAW, "cox_raw"},
 	{ModelType::TIME_VARYING_COX, "cox_time"},
- 	{ModelType::FINE_GRAY, "fgr"},
+	{ModelType::FINE_GRAY, "fgr"},
  };
 
 void RcppCcdInterface::logResultsToFile(const std::string& fileName, bool withASE) {
@@ -307,16 +375,16 @@ Eigen::MatrixXd cyclopsGetFisherInformation(SEXP inRcppCcdInterface, const SEXP 
 	using namespace bsccs;
 	XPtr<RcppCcdInterface> interface(inRcppCcdInterface);
 
-// 	const int p = interface->getCcd().getBetaSize();
-// 	std::vector<size_t> indices;
-// 	for (int i = 0; i < p; ++i) indices.push_back(i);
+//	const int p = interface->getCcd().getBetaSize();
+//	std::vector<size_t> indices;
+//	for (int i = 0; i < p; ++i) indices.push_back(i);
 
     std::vector<IdType> indices;
     if (!Rf_isNull(sexpBitCovariates)) {
 
         const std::vector<double>& bitCovariates = as<std::vector<double>>(sexpBitCovariates);
-    	ProfileVector covariates =  reinterpret_cast<const std::vector<int64_t>&>(bitCovariates); // as<ProfileVector>(sexpCovariates);
-    	for (auto it = covariates.begin(); it != covariates.end(); ++it) {
+	ProfileVector covariates =  reinterpret_cast<const std::vector<int64_t>&>(bitCovariates); // as<ProfileVector>(sexpCovariates);
+	for (auto it = covariates.begin(); it != covariates.end(); ++it) {
 	        size_t index = interface->getModelData().getColumnIndex(*it);
 	        indices.push_back(index);
 	    }
@@ -353,35 +421,35 @@ void cyclopsSetPrior(SEXP inRcppCcdInterface, const std::vector<std::string>& pr
 	XPtr<RcppCcdInterface> interface(inRcppCcdInterface);
 
 //	priors::PriorType priorType = RcppCcdInterface::parsePriorType(priorTypeName);
- 	ProfileVector exclude;
- 	if (!Rf_isNull(excludeNumeric)) {
+	ProfileVector exclude;
+	if (!Rf_isNull(excludeNumeric)) {
 
- 	    const std::vector<double>& bitExcludeNumeric = as<std::vector<double>>(excludeNumeric);
- 	    exclude = reinterpret_cast<const std::vector<int64_t>&>(bitExcludeNumeric);
- 		//exclude = as<ProfileVector>(excludeNumeric);
- 	}
+	    const std::vector<double>& bitExcludeNumeric = as<std::vector<double>>(excludeNumeric);
+	    exclude = reinterpret_cast<const std::vector<int64_t>&>(bitExcludeNumeric);
+		//exclude = as<ProfileVector>(excludeNumeric);
+	}
 
- 	HierarchicalChildMap map;
- 	if (!Rf_isNull(sexpGraph)) {
- 		map = as<HierarchicalChildMap>(sexpGraph);
- 	}
+	HierarchicalChildMap map;
+	if (!Rf_isNull(sexpGraph)) {
+		map = as<HierarchicalChildMap>(sexpGraph);
+	}
 
- 	NeighborhoodMap neighborhood;
- 	if (!Rf_isNull(sexpNeighborhood)) {
- 		for (int i = 0; i < sexpNeighborhood.size(); ++i) {
- 			Rcpp::List element = sexpNeighborhood[i];
+	NeighborhoodMap neighborhood;
+	if (!Rf_isNull(sexpNeighborhood)) {
+		for (int i = 0; i < sexpNeighborhood.size(); ++i) {
+			Rcpp::List element = sexpNeighborhood[i];
 
- 		    const std::vector<double>& bitElement1 = as<std::vector<double>>(element[1]);
- 		    double bitElement0 = element[0];
- 		    IdType element0;
- 		    std::memcpy(&element0, &bitElement0, sizeof(double));
+		    const std::vector<double>& bitElement1 = as<std::vector<double>>(element[1]);
+		    double bitElement0 = element[0];
+		    IdType element0;
+		    std::memcpy(&element0, &bitElement0, sizeof(double));
 
- 			neighborhood[
- 			    // as<IdType>(element[0])
- 			    element0
- 			    ] = reinterpret_cast<const std::vector<IdType>&>(bitElement1); // as<ProfileVector>(element[1]);
- 		}
- 	}
+			neighborhood[
+			    // as<IdType>(element[0])
+			    element0
+			    ] = reinterpret_cast<const std::vector<IdType>&>(bitElement1); // as<ProfileVector>(element[1]);
+		}
+	}
 
     interface->setPrior(priorTypeName, variance, exclude, map, neighborhood);
 }
@@ -534,7 +602,7 @@ List cyclopsProfileModel(SEXP inRcppCcdInterface, SEXP sexpCovariates, int threa
         std::vector<int> evals;
 
         for (ProfileVector::const_iterator it = covariates.begin();
-        		it != covariates.end(); ++it) {
+		it != covariates.end(); ++it) {
             ProfileInformation info = profileMap[*it];
             lower.push_back(info.lower95Bound);
             upper.push_back(info.upper95Bound);
@@ -591,7 +659,12 @@ void cyclopsSetControl(SEXP inRcppCcdInterface,
 		const std::string& noiseLevel, int threads, int seed, bool resetCoefficients, double startingVariance,
         bool useKKTSwindle, int swindleMultipler, const std::string& selectorType, double initialBound,
         int maxBoundCount, const std::string& algorithm, bool doItAll, bool syncCV,
-        const std::string& logisticKernel
+        const std::string& logisticKernel, const std::string& sparseConvergenceType,
+        double sparseActiveKktTolerance, double sparseActiveKktMovementTolerance,
+        double sparseActiveKktPolishTolerance, int sparseActiveKktCheckEvery,
+        const std::string& cvPolishPolicy, double cvPolishTolerance,
+        int cvPolishMaxIterations, int cvPolishInitialCandidates,
+        bool cvPolishStopProposal
 		) {
 	using namespace bsccs;
 	XPtr<RcppCcdInterface> interface(inRcppCcdInterface);
@@ -602,15 +675,26 @@ void cyclopsSetControl(SEXP inRcppCcdInterface,
 	args.modeFinding.convergenceType = RcppCcdInterface::parseConvergenceType(convergenceType);
     args.modeFinding.useKktSwindle = useKKTSwindle;
     args.modeFinding.swindleMultipler = swindleMultipler;
-    args.modeFinding.initialBound = initialBound;
-    args.modeFinding.maxBoundCount = maxBoundCount;
-    args.modeFinding.doItAll = doItAll;
+	    args.modeFinding.initialBound = initialBound;
+	    args.modeFinding.maxBoundCount = maxBoundCount;
+	    args.modeFinding.doItAll = doItAll;
+	    args.modeFinding.sparseConvergenceType = sparseConvergenceType;
+	    args.modeFinding.sparseActiveKktTolerance = sparseActiveKktTolerance;
+	    args.modeFinding.sparseActiveKktMovementTolerance = sparseActiveKktMovementTolerance;
+	    args.modeFinding.sparseActiveKktPolishTolerance = sparseActiveKktPolishTolerance;
+	    args.modeFinding.sparseActiveKktCheckEvery = sparseActiveKktCheckEvery;
 
     if (algorithm == "mm") {
         args.modeFinding.algorithmType = AlgorithmType::MM;
     }
     if (logisticKernel == "auto" || logisticKernel == "sparse-residual") {
         args.modeFinding.logisticKernel = LogisticKernelType::SPARSE_RESIDUAL;
+    } else if (logisticKernel == "sparse-residual-active") {
+        args.modeFinding.logisticKernel = LogisticKernelType::SPARSE_RESIDUAL_ACTIVE;
+    } else if (logisticKernel == "sparse-residual-strong") {
+        args.modeFinding.logisticKernel = LogisticKernelType::SPARSE_RESIDUAL_STRONG;
+    } else if (logisticKernel == "sparse-residual-active-strong") {
+        args.modeFinding.logisticKernel = LogisticKernelType::SPARSE_RESIDUAL_ACTIVE_STRONG;
     } else if (logisticKernel == "legacy") {
         args.modeFinding.logisticKernel = LogisticKernelType::LEGACY;
     } else {
@@ -626,6 +710,11 @@ void cyclopsSetControl(SEXP inRcppCcdInterface,
 	args.crossValidation.gridSteps = gridSteps;
 	args.crossValidation.startingVariance = startingVariance;
 	args.crossValidation.selectorType = RcppCcdInterface::parseSelectorType(selectorType);
+	args.crossValidation.polishPolicy = cvPolishPolicy;
+	args.crossValidation.polishTolerance = cvPolishTolerance;
+	args.crossValidation.polishMaxIterations = cvPolishMaxIterations;
+	args.crossValidation.polishInitialCandidates = cvPolishInitialCandidates;
+	args.crossValidation.polishStopProposal = cvPolishStopProposal;
 	args.crossValidation.syncCV = syncCV;
 
 	NoiseLevels noise = RcppCcdInterface::parseNoiseLevel(noiseLevel);
@@ -689,6 +778,7 @@ List cyclopsFitModel(SEXP inRcppCcdInterface) {
 	using namespace bsccs;
 
 	XPtr<RcppCcdInterface> interface(inRcppCcdInterface);
+	interface->getCcd().resetSparseLogisticPerformanceCounters();
 	double timeUpdate = interface->fitModel();
 
 	interface->diagnoseModel(0.0, 0.0);
@@ -977,9 +1067,9 @@ bsccs::priors::PriorType RcppCcdInterface::parsePriorType(const std::string& pri
 	} else if (priorName == "jeffreys") {
 	    priorType = JEFFREYS;
 	} else {
- 		handleError("Invalid prior type.");
- 	}
- 	return priorType;
+		handleError("Invalid prior type.");
+	}
+	return priorType;
 }
 
 bsccs::SelectorType RcppCcdInterface::parseSelectorType(const std::string& selectorName) {
@@ -1015,31 +1105,31 @@ bsccs::NormalizationType RcppCcdInterface::parseNormalizationType(const std::str
 }
 
 //  static std::map<ModelType, std::string> modelTypeNames = {
-//  	{ModelType::NORMAL, "ls"},
-//  	{ModelType::POISSON, "pr"},
-//  	{ModelType::LOGISTIC, "lr"},
-//  	{ModelType::CONDITIONAL_LOGISTIC, "clr"},
-//  	{ModelType::TIED_CONDITIONAL_LOGISTIC, "clr_exact"},
-//  	{ModelType::CONDITIONAL_POISSON, "cpr"},
-//  	{ModelType::SELF_CONTROLLED_MODEL, "sccs"},
-//  	{ModelType::COX, "cox"},
-//  	{ModelType::COX_RAW, "cox_raw"}
+//	{ModelType::NORMAL, "ls"},
+//	{ModelType::POISSON, "pr"},
+//	{ModelType::LOGISTIC, "lr"},
+//	{ModelType::CONDITIONAL_LOGISTIC, "clr"},
+//	{ModelType::TIED_CONDITIONAL_LOGISTIC, "clr_exact"},
+//	{ModelType::CONDITIONAL_POISSON, "cpr"},
+//	{ModelType::SELF_CONTROLLED_MODEL, "sccs"},
+//	{ModelType::COX, "cox"},
+//	{ModelType::COX_RAW, "cox_raw"}
 //  };
 
 bsccs::ModelType RcppCcdInterface::parseModelType(const std::string& modelName) {
 	// Parse type of model
- 	bsccs::ModelType modelType =  bsccs::ModelType::NONE;
- 	auto model = begin(modelTypeNames);
- 	for ( ; model != end(modelTypeNames); ++model) {
- 		if (modelName == model->second) {
- 			modelType = model->first;
- 			break;
- 		}
- 	}
- 	if (model == end(modelTypeNames)) {
- 		handleError("Invalid model type.");
- 	}
- 	return modelType;
+	bsccs::ModelType modelType =  bsccs::ModelType::NONE;
+	auto model = begin(modelTypeNames);
+	for ( ; model != end(modelTypeNames); ++model) {
+		if (modelName == model->second) {
+			modelType = model->first;
+			break;
+		}
+	}
+	if (model == end(modelTypeNames)) {
+		handleError("Invalid model type.");
+	}
+	return modelType;
 }
 
 void RcppCcdInterface::setNoiseLevel(bsccs::NoiseLevels noiseLevel) {
@@ -1095,8 +1185,8 @@ priors::JointPriorPtr RcppCcdInterface::makePrior(const std::vector<std::string>
 
     const size_t length = modelData->getNumberOfCovariates();
 
- 	if (   flatPrior.size() == 0
- 	    && hierarchyMap.size() == 0
+	if (   flatPrior.size() == 0
+	    && hierarchyMap.size() == 0
         && neighborhood.size() == 0
         && basePriorName.size() == length
         && baseVariance.size() == length) {
@@ -1119,10 +1209,10 @@ priors::JointPriorPtr RcppCcdInterface::makePrior(const std::vector<std::string>
 
     JointPriorPtr prior;
 
- 	if (flatPrior.size() == 0 && neighborhood.size() == 0) {
- 		if (hierarchyMap.size() == 0) {
-	 		prior = bsccs::make_shared<FullyExchangeableJointPrior>(singlePrior);
-	 	} else {
+	if (flatPrior.size() == 0 && neighborhood.size() == 0) {
+		if (hierarchyMap.size() == 0) {
+			prior = bsccs::make_shared<FullyExchangeableJointPrior>(singlePrior);
+		} else {
 			bsccs::shared_ptr<HierarchicalJointPrior> hPrior =
                 bsccs::make_shared<HierarchicalJointPrior>(singlePrior, 2); //Depth of hierarchy fixed at 2 right now
                 // TODO Check normal at top of hierarchy!
@@ -1136,19 +1226,19 @@ priors::JointPriorPtr RcppCcdInterface::makePrior(const std::vector<std::string>
 					parentMap.push_back(parent);
 				});
 			}
-   		    hPrior->setHierarchy(
+		    hPrior->setHierarchy(
                 parentMap,
                 hierarchyMap
             );
 			//hPrior->setVariance(0, baseVariance[0]);
 			//hPrior->setVariance(1, baseVariance[1]);
             prior = hPrior;
-	 	}
- 	} else {
- 		const int length =  modelData->getNumberOfCovariates();
- 		bsccs::shared_ptr<MixtureJointPrior> mixturePrior = bsccs::make_shared<MixtureJointPrior>(
- 						singlePrior, length
- 				);
+		}
+	} else {
+		const int length =  modelData->getNumberOfCovariates();
+		bsccs::shared_ptr<MixtureJointPrior> mixturePrior = bsccs::make_shared<MixtureJointPrior>(
+						singlePrior, length
+				);
 
 		if (flatPrior.size() > 0) {
 			PriorPtr noPrior = bsccs::make_shared<NoPrior>();
@@ -1165,48 +1255,48 @@ priors::JointPriorPtr RcppCcdInterface::makePrior(const std::vector<std::string>
 			}
 		}
 
- 		if (neighborhood.size() > 0) {
+		if (neighborhood.size() > 0) {
 
 			// shared across all index covariates
- 			// PriorPtr classPrior = bsccs::priors::CovariatePrior::makePrior(parsePriorType(basePriorName[1]), baseVariance[1]);
+			// PriorPtr classPrior = bsccs::priors::CovariatePrior::makePrior(parsePriorType(basePriorName[1]), baseVariance[1]);
 
- 			VariancePtr baseVariance0 = singlePrior->getVarianceParameters()[0];
- 		    VariancePtr baseVariance1 = CovariatePrior::makeVariance(baseVariance[1]);
- 		    mixturePrior->addVarianceParameter(baseVariance1);
+			VariancePtr baseVariance0 = singlePrior->getVarianceParameters()[0];
+		    VariancePtr baseVariance1 = CovariatePrior::makeVariance(baseVariance[1]);
+		    mixturePrior->addVarianceParameter(baseVariance1);
 
- 			for (const auto& element : neighborhood) {
- 				int index = modelData->getColumnIndexByName(element.first);
- 				if (index == -1) {
- 					std::stringstream error;
- 					error << "Variable " << element.first << " not found.";
- 					handleError(error.str());
- 				} else {
- 					std::vector<int> neighbors;
- 					for (const auto i : element.second) {
- 						int which = modelData->getColumnIndexByName(i);
- 						if (which == -1) {
+			for (const auto& element : neighborhood) {
+				int index = modelData->getColumnIndexByName(element.first);
+				if (index == -1) {
+					std::stringstream error;
+					error << "Variable " << element.first << " not found.";
+					handleError(error.str());
+				} else {
+					std::vector<int> neighbors;
+					for (const auto i : element.second) {
+						int which = modelData->getColumnIndexByName(i);
+						if (which == -1) {
 							std::stringstream error;
 							error << "Variable " << element.first << " not found.";
 							handleError(error.str());
- 						} else {
- 							neighbors.push_back(which);
- 						}
- 					}
+						} else {
+							neighbors.push_back(which);
+						}
+					}
 
- 					PriorPtr fusedPrior = bsccs::make_shared<FusedLaplacePrior>(
- 					    baseVariance0, baseVariance1, neighbors
- 					);
- 					mixturePrior->changePrior(fusedPrior, index);
- 				}
- 			}
- 		}
+					PriorPtr fusedPrior = bsccs::make_shared<FusedLaplacePrior>(
+					    baseVariance0, baseVariance1, neighbors
+					);
+					mixturePrior->changePrior(fusedPrior, index);
+				}
+			}
+		}
 
- 		prior = mixturePrior;
- 		if (hierarchyMap.size() != 0) {
- 			handleError("Mixtures of flat and hierarchical priors are not yet implemented.");
- 		}
- 	}
- 	return prior;
+		prior = mixturePrior;
+		if (hierarchyMap.size() != 0) {
+			handleError("Mixtures of flat and hierarchical priors are not yet implemented.");
+		}
+	}
+	return prior;
 }
 // TODO Massive code duplicate (to remove) with CmdLineCcdInterface
 void RcppCcdInterface::initializeModelImpl(
@@ -1230,79 +1320,79 @@ void RcppCcdInterface::initializeModelImpl(
 	}
 
  // Hierarchy management
-// 	HierarchyReader* hierarchyData;
-// 	if (arguments.useHierarchy) {
-// 		hierarchyData = new HierarchyReader(arguments.hierarchyFileName.c_str(), *modelData);
-// 	}
+//	HierarchyReader* hierarchyData;
+//	if (arguments.useHierarchy) {
+//		hierarchyData = new HierarchyReader(arguments.hierarchyFileName.c_str(), *modelData);
+//	}
 
 
- 	using namespace bsccs::priors;
-//  	PriorPtr singlePrior;
-//  	if (arguments.useNormalPrior) {
-//  		singlePrior = bsccs::make_shared<NormalPrior>();
-//  	} else if (arguments.computeMLE) {
-//  		if (arguments.fitMLEAtMode) {
-//  			handleError("Unable to compute MLE at posterior mode, if mode is not first explored.");
-//  		}
-//  		singlePrior = bsccs::make_shared<NoPrior>();
-//  	} else {
-//  		singlePrior = bsccs::make_shared<LaplacePrior>();
-//  	}
-//  	singlePrior->setVariance(0, arguments.hyperprior);
+	using namespace bsccs::priors;
+//	PriorPtr singlePrior;
+//	if (arguments.useNormalPrior) {
+//		singlePrior = bsccs::make_shared<NormalPrior>();
+//	} else if (arguments.computeMLE) {
+//		if (arguments.fitMLEAtMode) {
+//			handleError("Unable to compute MLE at posterior mode, if mode is not first explored.");
+//		}
+//		singlePrior = bsccs::make_shared<NoPrior>();
+//	} else {
+//		singlePrior = bsccs::make_shared<LaplacePrior>();
+//	}
+//	singlePrior->setVariance(0, arguments.hyperprior);
 
- 	JointPriorPtr prior = nullptr;
-//  	if (arguments.flatPrior.size() == 0) {
-//  		prior = bsccs::make_shared<FullyExchangeableJointPrior>(singlePrior);
-//  	} else {
-//  		const int length =  (*modelData)->getNumberOfColumns();
-//  		bsccs::shared_ptr<MixtureJointPrior> mixturePrior = bsccs::make_shared<MixtureJointPrior>(
-//  						singlePrior, length
-//  				);
+	JointPriorPtr prior = nullptr;
+//	if (arguments.flatPrior.size() == 0) {
+//		prior = bsccs::make_shared<FullyExchangeableJointPrior>(singlePrior);
+//	} else {
+//		const int length =  (*modelData)->getNumberOfColumns();
+//		bsccs::shared_ptr<MixtureJointPrior> mixturePrior = bsccs::make_shared<MixtureJointPrior>(
+//						singlePrior, length
+//				);
 //
-//  		PriorPtr noPrior = bsccs::make_shared<NoPrior>();
-//  		for (ProfileVector::const_iterator it = arguments.flatPrior.begin();
-//  				it != arguments.flatPrior.end(); ++it) {
-//  			int index = (*modelData)->getColumnIndexByName(*it);
-//  			if (index == -1) {
-//  				std::stringstream error;
-//  				error << "Variable " << *it << " not found.";
-//  				handleError(error.str());
-//  			} else {
-//  				mixturePrior->changePrior(noPrior, index);
-//  			}
-//  		}
-//  		prior = mixturePrior;
-//  	}
+//		PriorPtr noPrior = bsccs::make_shared<NoPrior>();
+//		for (ProfileVector::const_iterator it = arguments.flatPrior.begin();
+//				it != arguments.flatPrior.end(); ++it) {
+//			int index = (*modelData)->getColumnIndexByName(*it);
+//			if (index == -1) {
+//				std::stringstream error;
+//				error << "Variable " << *it << " not found.";
+//				handleError(error.str());
+//			} else {
+//				mixturePrior->changePrior(noPrior, index);
+//			}
+//		}
+//		prior = mixturePrior;
+//	}
 
- 	//Hierarchy prior
-// 	if (arguments.useHierarchy) {
-// 		std::shared_ptr<HierarchicalJointPrior> hierarchicalPrior = std::make_shared<HierarchicalJointPrior>(singlePrior, 2); //Depth of hierarchy fixed at 2 right now
-// 		PriorPtr classPrior = std::make_shared<NormalPrior>();
-// 		hierarchicalPrior->changePrior(classPrior,1);
+	//Hierarchy prior
+//	if (arguments.useHierarchy) {
+//		std::shared_ptr<HierarchicalJointPrior> hierarchicalPrior = std::make_shared<HierarchicalJointPrior>(singlePrior, 2); //Depth of hierarchy fixed at 2 right now
+//		PriorPtr classPrior = std::make_shared<NormalPrior>();
+//		hierarchicalPrior->changePrior(classPrior,1);
 //         hierarchicalPrior->setHierarchy(
 //                 hierarchyData->returnGetParentMap(),
 //                 hierarchyData->returnGetChildMap()
 //             );
-// 		hierarchicalPrior->setVariance(0,arguments.hyperprior);
-// 		hierarchicalPrior->setVariance(1,arguments.classHierarchyVariance);
-// 		prior = hierarchicalPrior;
-// 	}
+//		hierarchicalPrior->setVariance(0,arguments.hyperprior);
+//		hierarchicalPrior->setVariance(1,arguments.classHierarchyVariance);
+//		prior = hierarchicalPrior;
+//	}
 
   logger = bsccs::make_shared<loggers::RcppProgressLogger>();
   error = bsccs::make_shared<loggers::RcppErrorHandler>();
 
- 	*ccd = new CyclicCoordinateDescent(
+	*ccd = new CyclicCoordinateDescent(
          **modelData /* TODO Change to ref */,
          //bsccs::shared_ptr<ModelData>(*modelData),
          **model, prior, logger, error);
 
- 	(*ccd)->setNoiseLevel(arguments.noiseLevel);
+	(*ccd)->setNoiseLevel(arguments.noiseLevel);
 
 }
 
 void RcppCcdInterface::predictModelImpl(CyclicCoordinateDescent *ccd, AbstractModelData *modelData) {
 
-// 	bsccs::PredictionOutputWriter predictor(*ccd, *modelData);
+//	bsccs::PredictionOutputWriter predictor(*ccd, *modelData);
 //
 //     result = List::create();
 //     OutputHelper::RcppOutputHelper test(result);
@@ -1325,31 +1415,36 @@ void RcppCcdInterface::predictModelImpl(CyclicCoordinateDescent *ccd, AbstractMo
     );
 
 //     predictions.resize(ccd.getPredictionSize());
-// 		ccd.getPredictiveEstimates(&predictions[0], NULL);
+//		ccd.getPredictiveEstimates(&predictions[0], NULL);
 
 }
 
 void RcppCcdInterface::logModelImpl(CyclicCoordinateDescent *ccd, AbstractModelData *modelData,
 	    ProfileInformationMap& profileMap, bool withASE) {
 
- 		// TODO Move into super-class
-  	EstimationOutputWriter estimates(*ccd, *modelData);
-  	estimates.addBoundInformation(profileMap);
-  	// End move
+		// TODO Move into super-class
+	EstimationOutputWriter estimates(*ccd, *modelData);
+	estimates.addBoundInformation(profileMap);
+	// End move
 
 		result = List::create();
 		OutputHelper::RcppOutputHelper out(result);
-  	estimates.writeStream(out);
+	estimates.writeStream(out);
 }
 
 void RcppCcdInterface::diagnoseModelImpl(CyclicCoordinateDescent *ccd, AbstractModelData *modelData,
 		double loadTime,
 		double updateTime) {
 
-		result = List::create();
- 		DiagnosticsOutputWriter diagnostics(*ccd, *modelData);
+	result = List::create();
+	DiagnosticsOutputWriter diagnostics(*ccd, *modelData);
+	{
 		OutputHelper::RcppOutputHelper test(result);
-  	diagnostics.writeStream(test);
+		diagnostics.writeStream(test);
+	}
+	for (const auto& item : ccd->getSparseLogisticPerformanceCounters().asExtraInformation()) {
+		result[item.first] = item.second;
+	}
 }
 
 RcppCcdInterface::RcppCcdInterface(AbstractModelData& _rcppModelData)

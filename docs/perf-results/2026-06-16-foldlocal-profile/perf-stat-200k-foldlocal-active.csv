@@ -1,0 +1,18 @@
+# started on Tue Jun 16 11:16:18 2026
+
+213858376650,,cpu_atom/cycles/,479583,0.00,,
+252370008991,,cpu_core/cycles/,55091960913,99.00,,
+181432063674,,cpu_atom/instructions/,479583,0.00,0.85,insn per cycle
+869457645243,,cpu_core/instructions/,55091960913,99.00,3.45,insn per cycle
+2205958373,,cpu_atom/cache-references/,479583,0.00,,
+3103050550,,cpu_core/cache-references/,55091960913,99.00,,
+1193099186,,cpu_atom/cache-misses/,479583,0.00,54.09,of all cache refs
+1658418884,,cpu_core/cache-misses/,55091960913,99.00,53.44,of all cache refs
+45064824372,,cpu_atom/L1-dcache-loads/,479583,0.00,,
+144379791181,,cpu_core/L1-dcache-loads/,55091960913,99.00,,
+<not supported>,,cpu_atom/L1-dcache-load-misses/,0,100.00,,
+23929780711,,cpu_core/L1-dcache-load-misses/,55091960913,99.00,16.57,of all L1-dcache accesses
+45064824372,,cpu_atom/dTLB-loads/,479583,0.00,,
+144379791181,,cpu_core/dTLB-loads/,55091960913,99.00,,
+51349445,,cpu_atom/dTLB-load-misses/,479583,0.00,0.11,of all dTLB cache accesses
+16333201,,cpu_core/dTLB-load-misses/,55091960913,99.00,0.01,of all dTLB cache accesses

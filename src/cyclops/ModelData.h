@@ -236,6 +236,7 @@ public:
             loggers::ErrorHandlerPtr _error
 			) :
 		modelType(_modelType), nPatients(0), nStrata(0), hasOffsetCovariate(false), hasInterceptCovariate(false), isFinalized(false)
+		, nTypes(1), maxCovariateId(0)
 		, pid(_pid.begin(), _pid.end()) // copy
 		, y(_y.begin(), _y.end()) // copy
 		, z(_z.begin(), _z.end()) // copy
@@ -248,6 +249,12 @@ public:
 	}
 
 	virtual ~ModelData();
+
+	ModelData<RealType>* createRowSubsetFromBinaryWeights(
+		const std::vector<double>& weights,
+		bool copyRowLabels = true,
+		std::vector<int>* keptRowsOut = nullptr
+	) const;
 
 	AbstractModelData* castToFloat() {
 	    auto* floatModelData = new ModelData<float>(modelType, pid, y, z, offs, log, error);

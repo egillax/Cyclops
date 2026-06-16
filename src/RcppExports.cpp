@@ -11,6 +11,18 @@ Rcpp::Rostream<true>&  Rcpp::Rcout = Rcpp::Rcpp_cout_get();
 Rcpp::Rostream<false>& Rcpp::Rcerr = Rcpp::Rcpp_cerr_get();
 #endif
 
+// cyclopsCompactRowsDgCMatrix
+S4 cyclopsCompactRowsDgCMatrix(S4 matrix, LogicalVector keepRows);
+RcppExport SEXP _Cyclops_cyclopsCompactRowsDgCMatrix(SEXP matrixSEXP, SEXP keepRowsSEXP) {
+BEGIN_RCPP
+    Rcpp::RObject rcpp_result_gen;
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< S4 >::type matrix(matrixSEXP);
+    Rcpp::traits::input_parameter< LogicalVector >::type keepRows(keepRowsSEXP);
+    rcpp_result_gen = Rcpp::wrap(cyclopsCompactRowsDgCMatrix(matrix, keepRows));
+    return rcpp_result_gen;
+END_RCPP
+}
 // cyclopsGetModelTypeNames
 std::vector<std::string> cyclopsGetModelTypeNames();
 RcppExport SEXP _Cyclops_cyclopsGetModelTypeNames() {
@@ -345,8 +357,8 @@ BEGIN_RCPP
 END_RCPP
 }
 // cyclopsSetControl
-void cyclopsSetControl(SEXP inRcppCcdInterface, int maxIterations, double tolerance, const std::string& convergenceType, bool useAutoSearch, int fold, int foldToCompute, double lowerLimit, double upperLimit, int gridSteps, const std::string& noiseLevel, int threads, int seed, bool resetCoefficients, double startingVariance, bool useKKTSwindle, int swindleMultipler, const std::string& selectorType, double initialBound, int maxBoundCount, const std::string& algorithm, bool doItAll, bool syncCV, const std::string& logisticKernel);
-RcppExport SEXP _Cyclops_cyclopsSetControl(SEXP inRcppCcdInterfaceSEXP, SEXP maxIterationsSEXP, SEXP toleranceSEXP, SEXP convergenceTypeSEXP, SEXP useAutoSearchSEXP, SEXP foldSEXP, SEXP foldToComputeSEXP, SEXP lowerLimitSEXP, SEXP upperLimitSEXP, SEXP gridStepsSEXP, SEXP noiseLevelSEXP, SEXP threadsSEXP, SEXP seedSEXP, SEXP resetCoefficientsSEXP, SEXP startingVarianceSEXP, SEXP useKKTSwindleSEXP, SEXP swindleMultiplerSEXP, SEXP selectorTypeSEXP, SEXP initialBoundSEXP, SEXP maxBoundCountSEXP, SEXP algorithmSEXP, SEXP doItAllSEXP, SEXP syncCVSEXP, SEXP logisticKernelSEXP) {
+void cyclopsSetControl(SEXP inRcppCcdInterface, int maxIterations, double tolerance, const std::string& convergenceType, bool useAutoSearch, int fold, int foldToCompute, double lowerLimit, double upperLimit, int gridSteps, const std::string& noiseLevel, int threads, int seed, bool resetCoefficients, double startingVariance, bool useKKTSwindle, int swindleMultipler, const std::string& selectorType, double initialBound, int maxBoundCount, const std::string& algorithm, bool doItAll, bool syncCV, const std::string& logisticKernel, const std::string& sparseConvergenceType, double sparseActiveKktTolerance, double sparseActiveKktMovementTolerance, double sparseActiveKktPolishTolerance, int sparseActiveKktCheckEvery, const std::string& cvPolishPolicy, double cvPolishTolerance, int cvPolishMaxIterations, int cvPolishInitialCandidates, bool cvPolishStopProposal);
+RcppExport SEXP _Cyclops_cyclopsSetControl(SEXP inRcppCcdInterfaceSEXP, SEXP maxIterationsSEXP, SEXP toleranceSEXP, SEXP convergenceTypeSEXP, SEXP useAutoSearchSEXP, SEXP foldSEXP, SEXP foldToComputeSEXP, SEXP lowerLimitSEXP, SEXP upperLimitSEXP, SEXP gridStepsSEXP, SEXP noiseLevelSEXP, SEXP threadsSEXP, SEXP seedSEXP, SEXP resetCoefficientsSEXP, SEXP startingVarianceSEXP, SEXP useKKTSwindleSEXP, SEXP swindleMultiplerSEXP, SEXP selectorTypeSEXP, SEXP initialBoundSEXP, SEXP maxBoundCountSEXP, SEXP algorithmSEXP, SEXP doItAllSEXP, SEXP syncCVSEXP, SEXP logisticKernelSEXP, SEXP sparseConvergenceTypeSEXP, SEXP sparseActiveKktToleranceSEXP, SEXP sparseActiveKktMovementToleranceSEXP, SEXP sparseActiveKktPolishToleranceSEXP, SEXP sparseActiveKktCheckEverySEXP, SEXP cvPolishPolicySEXP, SEXP cvPolishToleranceSEXP, SEXP cvPolishMaxIterationsSEXP, SEXP cvPolishInitialCandidatesSEXP, SEXP cvPolishStopProposalSEXP) {
 BEGIN_RCPP
     Rcpp::RNGScope rcpp_rngScope_gen;
     Rcpp::traits::input_parameter< SEXP >::type inRcppCcdInterface(inRcppCcdInterfaceSEXP);
@@ -370,12 +382,22 @@ BEGIN_RCPP
     Rcpp::traits::input_parameter< double >::type initialBound(initialBoundSEXP);
     Rcpp::traits::input_parameter< int >::type maxBoundCount(maxBoundCountSEXP);
     Rcpp::traits::input_parameter< const std::string& >::type algorithm(algorithmSEXP);
-    Rcpp::traits::input_parameter< bool >::type doItAll(doItAllSEXP);
-    Rcpp::traits::input_parameter< bool >::type syncCV(syncCVSEXP);
-    Rcpp::traits::input_parameter< const std::string& >::type logisticKernel(logisticKernelSEXP);
-    cyclopsSetControl(inRcppCcdInterface, maxIterations, tolerance, convergenceType, useAutoSearch, fold, foldToCompute, lowerLimit, upperLimit, gridSteps, noiseLevel, threads, seed, resetCoefficients, startingVariance, useKKTSwindle, swindleMultipler, selectorType, initialBound, maxBoundCount, algorithm, doItAll, syncCV, logisticKernel);
-    return R_NilValue;
-END_RCPP
+	    Rcpp::traits::input_parameter< bool >::type doItAll(doItAllSEXP);
+	    Rcpp::traits::input_parameter< bool >::type syncCV(syncCVSEXP);
+	    Rcpp::traits::input_parameter< const std::string& >::type logisticKernel(logisticKernelSEXP);
+	    Rcpp::traits::input_parameter< const std::string& >::type sparseConvergenceType(sparseConvergenceTypeSEXP);
+	    Rcpp::traits::input_parameter< double >::type sparseActiveKktTolerance(sparseActiveKktToleranceSEXP);
+	    Rcpp::traits::input_parameter< double >::type sparseActiveKktMovementTolerance(sparseActiveKktMovementToleranceSEXP);
+	    Rcpp::traits::input_parameter< double >::type sparseActiveKktPolishTolerance(sparseActiveKktPolishToleranceSEXP);
+	    Rcpp::traits::input_parameter< int >::type sparseActiveKktCheckEvery(sparseActiveKktCheckEverySEXP);
+	    Rcpp::traits::input_parameter< const std::string& >::type cvPolishPolicy(cvPolishPolicySEXP);
+	    Rcpp::traits::input_parameter< double >::type cvPolishTolerance(cvPolishToleranceSEXP);
+	    Rcpp::traits::input_parameter< int >::type cvPolishMaxIterations(cvPolishMaxIterationsSEXP);
+	    Rcpp::traits::input_parameter< int >::type cvPolishInitialCandidates(cvPolishInitialCandidatesSEXP);
+	    Rcpp::traits::input_parameter< bool >::type cvPolishStopProposal(cvPolishStopProposalSEXP);
+	    cyclopsSetControl(inRcppCcdInterface, maxIterations, tolerance, convergenceType, useAutoSearch, fold, foldToCompute, lowerLimit, upperLimit, gridSteps, noiseLevel, threads, seed, resetCoefficients, startingVariance, useKKTSwindle, swindleMultipler, selectorType, initialBound, maxBoundCount, algorithm, doItAll, syncCV, logisticKernel, sparseConvergenceType, sparseActiveKktTolerance, sparseActiveKktMovementTolerance, sparseActiveKktPolishTolerance, sparseActiveKktCheckEvery, cvPolishPolicy, cvPolishTolerance, cvPolishMaxIterations, cvPolishInitialCandidates, cvPolishStopProposal);
+	    return R_NilValue;
+	END_RCPP
 }
 // cyclopsRunCrossValidationl
 List cyclopsRunCrossValidationl(SEXP inRcppCcdInterface);
@@ -946,8 +968,21 @@ BEGIN_RCPP
     return rcpp_result_gen;
 END_RCPP
 }
+// cyclopsMakeFoldLocalData
+List cyclopsMakeFoldLocalData(Environment object, LogicalVector keepRows);
+RcppExport SEXP _Cyclops_cyclopsMakeFoldLocalData(SEXP objectSEXP, SEXP keepRowsSEXP) {
+BEGIN_RCPP
+    Rcpp::RObject rcpp_result_gen;
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< Environment >::type object(objectSEXP);
+    Rcpp::traits::input_parameter< LogicalVector >::type keepRows(keepRowsSEXP);
+    rcpp_result_gen = Rcpp::wrap(cyclopsMakeFoldLocalData(object, keepRows));
+    return rcpp_result_gen;
+END_RCPP
+}
 
 static const R_CallMethodDef CallEntries[] = {
+    {"_Cyclops_cyclopsCompactRowsDgCMatrix", (DL_FUNC) &_Cyclops_cyclopsCompactRowsDgCMatrix, 2},
     {"_Cyclops_cyclopsGetModelTypeNames", (DL_FUNC) &_Cyclops_cyclopsGetModelTypeNames, 0},
     {"_Cyclops_cyclopsGetRemoveInterceptNames", (DL_FUNC) &_Cyclops_cyclopsGetRemoveInterceptNames, 0},
     {"_Cyclops_cyclopsGetIsSurvivalNames", (DL_FUNC) &_Cyclops_cyclopsGetIsSurvivalNames, 0},
@@ -976,7 +1011,7 @@ static const R_CallMethodDef CallEntries[] = {
     {"_Cyclops_cyclopsPredictModel", (DL_FUNC) &_Cyclops_cyclopsPredictModel, 1},
     {"_Cyclops_cyclopsSetConvergenceType", (DL_FUNC) &_Cyclops_cyclopsSetConvergenceType, 2},
     {"_Cyclops_cyclopsGetConvergenceType", (DL_FUNC) &_Cyclops_cyclopsGetConvergenceType, 1},
-    {"_Cyclops_cyclopsSetControl", (DL_FUNC) &_Cyclops_cyclopsSetControl, 24},
+    {"_Cyclops_cyclopsSetControl", (DL_FUNC) &_Cyclops_cyclopsSetControl, 34},
     {"_Cyclops_cyclopsRunCrossValidationl", (DL_FUNC) &_Cyclops_cyclopsRunCrossValidationl, 1},
     {"_Cyclops_cyclopsCacheForJava", (DL_FUNC) &_Cyclops_cyclopsCacheForJava, 1},
     {"_Cyclops_cyclopsClearCacheForJava", (DL_FUNC) &_Cyclops_cyclopsClearCacheForJava, 0},
@@ -1023,6 +1058,7 @@ static const R_CallMethodDef CallEntries[] = {
     {"_Cyclops_cyclopsGetInterceptLabel", (DL_FUNC) &_Cyclops_cyclopsGetInterceptLabel, 1},
     {"_Cyclops_cyclopsReadFileData", (DL_FUNC) &_Cyclops_cyclopsReadFileData, 2},
     {"_Cyclops_cyclopsModelData", (DL_FUNC) &_Cyclops_cyclopsModelData, 11},
+    {"_Cyclops_cyclopsMakeFoldLocalData", (DL_FUNC) &_Cyclops_cyclopsMakeFoldLocalData, 2},
     {NULL, NULL, 0}
 };
 

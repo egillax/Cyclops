@@ -1,0 +1,54 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 7K of event 'cpu_core/cycles/P'
+# Event count (approx.): 356347596528
+#
+# Overhead  Symbol                                                                                                                                                                                                                                                                                                                                                                                                        Shared Object            IPC   [IPC Coverage]
+# ........  ............................................................................................................................................................................................................................................................................................................................................................................................................  .......................  ....................
+#
+    38.44%  [.] bsccs::ModelSpecifics<bsccs::LogisticRegression<double>, double>::updateSparseLogisticState(double, int, bool)                                                                                                                                                                                                                                                                                            Cyclops.so               -      -            
+            |          
+             --37.95%--bsccs::ModelSpecifics<bsccs::LogisticRegression<double>, double>::updateSparseLogisticState(double, int, bool)
+                       |          
+                        --1.16%--0x3ff0000000000000
+
+    33.40%  [.] bsccs::sparseLogisticAvx2IndicatorGradientHessianDouble(int const*, double const*, unsigned long, bool, double&, double&)                                                                                                                                                                                                                                                                                 Cyclops.so               -      -            
+            |
+            ---bsccs::ModelSpecifics<bsccs::LogisticRegression<double>, double>::computeSparseLogisticGradientAndHessian(int, double*, double*, bool)
+
+     3.42%  [.] bsccs::ModelSpecifics<bsccs::LogisticRegression<double>, double>::ensureSparseLogisticWeightedColumnViews()                                                                                                                                                                                                                                                                                               Cyclops.so               -      -            
+            |          
+             --3.31%--bsccs::ModelSpecifics<bsccs::LogisticRegression<double>, double>::ensureSparseLogisticWeightedColumnViews()
+
+     2.92%  [.] HashLookup                                                                                                                                                                                                                                                                                                                                                                                                libR.so                  -      -            
+            |          
+             --2.90%--HashLookup
+                       0x627b9ec9bbe0
+
+     2.84%  [.] bsccs::ModelSpecifics<bsccs::LogisticRegression<double>, double>::computeSparseLogisticGradientAndHessian(int, double*, double*, bool)                                                                                                                                                                                                                                                                    Cyclops.so               -      -            
+            |          
+             --2.83%--bsccs::ModelSpecifics<bsccs::LogisticRegression<double>, double>::computeSparseLogisticGradientAndHessian(int, double*, double*, bool)
+
+     2.32%  [.] __log1p_fma                                                                                                                                                                                                                                                                                                                                                                                               libm.so.6                -      -            
+            |          
+             --1.89%--__log1p_fma
+
+     1.93%  [.] bsccs::ModelSpecifics<bsccs::LogisticRegression<double>, double>::getLogLikelihood(bool)                                                                                                                                                                                                                                                                                                                  Cyclops.so               -      -            
+            |          
+             --1.83%--bsccs::ModelSpecifics<bsccs::LogisticRegression<double>, double>::getLogLikelihood(bool)
+
+     1.55%  [.] __ieee754_exp_fma                                                                                                                                                                                                                                                                                                                                                                                         libm.so.6                -      -            
+            |          
+             --1.11%--__ieee754_exp_fma
+                       |          
+                        --1.10%--bsccs::ModelSpecifics<bsccs::LogisticRegression<double>, double>::updateSparseLogisticState(double, int, bool)
+
+     1.01%  [.] bsccs::ModelSpecifics<bsccs::LogisticRegression<double>, double>::computeXjY(bool)                                                                                                                                                                                                                                                                                                                        Cyclops.so               -      -            
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

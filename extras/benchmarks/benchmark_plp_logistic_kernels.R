@@ -21,6 +21,7 @@ usage <- function(status = 0) {
     "  --plp-data PATH          Saved PLP data directory or RDS object.\n\n",
     "Common options:\n",
     "  --out PATH               CSV output path. Default: kernel-benchmark-results.csv\n",
+    "  --reference-matrix-rds PATH  Original matrix for compressed-column diagnostics.\n",
     "  --kernels LIST           Comma-separated kernels. Default: legacy,sparse-residual\n",
     "  --mode MODE              fixed or cv. Default: cv\n",
     "  --variance VALUE         Fixed-fit Laplace variance. Default: 0.02\n",
@@ -28,6 +29,17 @@ usage <- function(status = 0) {
     "  --threads N              Cyclops threads. Default: folds\n",
     "  --seed N                 CV seed. Default: 42\n",
     "  --tolerance VALUE        Cyclops tolerance. Default: 1e-6\n",
+    "  --convergence-type TYPE  Cyclops convergence type. Default: gradient\n",
+    "  --sparse-convergence-type TYPE  auto, fitted-change, or coordinate-impact. Default: auto\n",
+    "  --sparse-active-kkt-tolerance VALUE  Active-coordinate KKT gate; negative disables. Default: -1\n",
+    "  --sparse-active-kkt-movement-tolerance VALUE  Movement threshold before KKT checks. Default: -1\n",
+    "  --sparse-active-kkt-polish-tolerance VALUE  KKT gate used by polish solves. Default: -1\n",
+    "  --sparse-active-kkt-check-every N  Check period after movement threshold. Default: 1\n",
+    "  --cv-polish-policy POLICY  none, selective, or all. Default: none\n",
+    "  --cv-polish-tolerance VALUE  Stricter CV/final-fit tolerance. Default: -1\n",
+    "  --cv-polish-max-iterations N  Polish iteration limit. Default: -1\n",
+    "  --cv-polish-initial-candidates N  Initial auto-search candidates to polish. Default: 1\n",
+    "  --cv-polish-stop-proposal TRUE/FALSE  Polish final stop proposal. Default: TRUE\n",
     "  --max-iterations N       Max CCD iterations. Default: 1000\n",
     "  --lower-limit VALUE      CV lower variance bound. Default: 0.01\n",
     "  --upper-limit VALUE      CV upper variance bound. Default: 20\n",
@@ -47,6 +59,7 @@ parse_args <- function(argv) {
     matrix_rds = NA_character_,
     plp_data = NA_character_,
     out = "kernel-benchmark-results.csv",
+    reference_matrix_rds = NA_character_,
     kernels = "legacy,sparse-residual",
     mode = "cv",
     variance = 0.02,
@@ -54,6 +67,17 @@ parse_args <- function(argv) {
     threads = NA_integer_,
     seed = 42L,
     tolerance = 1e-6,
+    convergence_type = "gradient",
+    sparse_convergence_type = "auto",
+    sparse_active_kkt_tolerance = -1,
+    sparse_active_kkt_movement_tolerance = -1,
+    sparse_active_kkt_polish_tolerance = -1,
+    sparse_active_kkt_check_every = 1L,
+    cv_polish_policy = "none",
+    cv_polish_tolerance = -1,
+    cv_polish_max_iterations = -1L,
+    cv_polish_initial_candidates = 1L,
+    cv_polish_stop_proposal = TRUE,
     max_iterations = 1000L,
     lower_limit = 0.01,
     upper_limit = 20,
@@ -83,13 +107,37 @@ parse_args <- function(argv) {
   }
 
   integer_args <- c("folds", "threads", "seed", "max_iterations", "grid_steps",
-                    "repetitions", "sample_size", "outcome_id")
-  numeric_args <- c("variance", "tolerance", "lower_limit", "upper_limit")
+                    "repetitions", "sample_size", "outcome_id",
+                    "sparse_active_kkt_check_every", "cv_polish_max_iterations",
+                    "cv_polish_initial_candidates")
+  numeric_args <- c("variance", "tolerance", "lower_limit", "upper_limit",
+                    "sparse_active_kkt_tolerance",
+                    "sparse_active_kkt_movement_tolerance",
+                    "sparse_active_kkt_polish_tolerance", "cv_polish_tolerance")
   for (name in integer_args) {
     args[[name]] <- if (is.na(args[[name]])) NA_integer_ else as.integer(args[[name]])
   }
   for (name in numeric_args) {
     args[[name]] <- as.numeric(args[[name]])
+  }
+  if (is.character(args$cv_polish_stop_proposal)) {
+    args$cv_polish_stop_proposal <- tolower(args$cv_polish_stop_proposal) %in%
+      c("1", "true", "t", "yes", "y")
+  }
+  if (!args$convergence_type %in% c("gradient", "lange", "mittal", "zhang")) {
+    stop("--convergence-type must be gradient, lange, mittal, or zhang")
+  }
+  if (!args$sparse_convergence_type %in% c("auto", "fitted-change", "coordinate-impact")) {
+    stop("--sparse-convergence-type must be auto, fitted-change, or coordinate-impact")
+  }
+  if (args$sparse_active_kkt_check_every < 1L) {
+    stop("--sparse-active-kkt-check-every must be at least 1")
+  }
+  if (!args$cv_polish_policy %in% c("none", "selective", "all")) {
+    stop("--cv-polish-policy must be none, selective, or all")
+  }
+  if (args$cv_polish_initial_candidates < 0L) {
+    stop("--cv-polish-initial-candidates must be non-negative")
   }
   args
 }
@@ -122,7 +170,21 @@ load_rds_input <- function(path) {
       x <- as(x, "dgCMatrix")
     }
     y <- as.integer(obj$y)
-    return(list(x = x, y = y, source = "matrix-rds"))
+    return(list(x = x, y = y, metadata = obj$metadata, source = "matrix-rds"))
+  }
+  obj
+}
+
+load_reference_matrix <- function(path, expected_y) {
+  if (is.na(path)) {
+    return(NULL)
+  }
+  obj <- load_rds_input(path)
+  if (!is.list(obj) || !all(c("x", "y") %in% names(obj))) {
+    stop("--reference-matrix-rds must contain list entries x and y")
+  }
+  if (length(obj$y) != length(expected_y) || any(as.integer(obj$y) != as.integer(expected_y))) {
+    stop("--reference-matrix-rds y does not match the fitted data")
   }
   obj
 }
@@ -257,10 +319,20 @@ stable_log1pexp <- function(eta) {
 compute_metrics <- function(x, y, beta, variance) {
   require_package("Matrix")
   if (is.null(beta) || all(is.na(beta))) {
-    return(list(log_likelihood_check = NA_real_, objective_check = NA_real_))
+    return(list(
+      log_likelihood_check = NA_real_,
+      objective_check = NA_real_,
+      kkt_max_violation = NA_real_,
+      prediction = NA_real_
+    ))
   }
   if (is.null(x)) {
-    return(list(log_likelihood_check = NA_real_, objective_check = NA_real_))
+    return(list(
+      log_likelihood_check = NA_real_,
+      objective_check = NA_real_,
+      kkt_max_violation = NA_real_,
+      prediction = NA_real_
+    ))
   }
 
   beta <- as.numeric(beta)
@@ -270,21 +342,82 @@ compute_metrics <- function(x, y, beta, variance) {
   } else if (length(beta) == ncol(x)) {
     eta <- as.numeric(x %*% beta)
   } else {
-    return(list(log_likelihood_check = NA_real_, objective_check = NA_real_))
+    return(list(
+      log_likelihood_check = NA_real_,
+      objective_check = NA_real_,
+      kkt_max_violation = NA_real_,
+      prediction = NA_real_
+    ))
   }
   log_likelihood <- sum(y * eta - stable_log1pexp(eta))
   lambda <- sqrt(2 / variance)
   penalized_beta <- if (length(beta) == ncol(x) + 1L) beta[-1L] else beta
   objective <- log_likelihood - lambda * sum(abs(penalized_beta))
+  p <- stats::plogis(eta)
+  residual <- y - p
+  gradient <- as.numeric(Matrix::crossprod(x, residual))
+  intercept_violation <- abs(sum(residual))
+  active <- abs(penalized_beta) > 0
+  coefficient_violation <- numeric(length(penalized_beta))
+  coefficient_violation[active] <- abs(gradient[active] - lambda * sign(penalized_beta[active]))
+  coefficient_violation[!active] <- pmax(0, abs(gradient[!active]) - lambda)
+  active_violation <- if (any(active)) {
+    max(coefficient_violation[active], na.rm = TRUE)
+  } else {
+    0
+  }
+  inactive_violation <- if (any(!active)) {
+    max(coefficient_violation[!active], na.rm = TRUE)
+  } else {
+    0
+  }
   list(
     log_likelihood_check = log_likelihood,
-    objective_check = objective
+    objective_check = objective,
+    kkt_max_violation = max(intercept_violation, coefficient_violation, na.rm = TRUE),
+    kkt_intercept_violation = intercept_violation,
+    kkt_active_violation = active_violation,
+    kkt_inactive_violation = inactive_violation,
+    prediction = p
   )
+}
+
+expand_duplicate_beta <- function(beta, data, reference) {
+  compression <- data$metadata$duplicateCompression
+  if (is.null(compression) || is.null(reference)) {
+    return(beta)
+  }
+
+  beta <- as.numeric(beta)
+  beta[is.na(beta)] <- 0
+  has_intercept <- length(beta) == ncol(data$x) + 1L
+  penalized <- if (has_intercept) beta[-1L] else beta
+  if (length(penalized) != ncol(data$x)) {
+    stop("Compressed beta length does not match compressed matrix")
+  }
+
+  kept <- as.integer(compression$keptColumns)
+  original_columns <- as.integer(compression$originalColumns)
+  if (length(kept) != ncol(data$x) || original_columns != ncol(reference$x)) {
+    stop("Duplicate-compression metadata does not match compressed/reference matrices")
+  }
+
+  expanded <- numeric(original_columns)
+  expanded[kept] <- penalized
+  if (has_intercept) {
+    c(beta[[1L]], expanded)
+  } else {
+    expanded
+  }
 }
 
 compute_prediction_metrics <- function(fit, y, beta, variance) {
   if (is.null(beta) || all(is.na(beta))) {
-    return(list(log_likelihood_check = NA_real_, objective_check = NA_real_))
+    return(list(
+      log_likelihood_check = NA_real_,
+      objective_check = NA_real_,
+      prediction = NA_real_
+    ))
   }
   beta <- as.numeric(beta)
   beta[is.na(beta)] <- 0
@@ -293,7 +426,11 @@ compute_prediction_metrics <- function(fit, y, beta, variance) {
     error = function(e) NA_real_
   )
   if (length(prediction) != length(y) || any(is.na(prediction))) {
-    return(list(log_likelihood_check = NA_real_, objective_check = NA_real_))
+    return(list(
+      log_likelihood_check = NA_real_,
+      objective_check = NA_real_,
+      prediction = NA_real_
+    ))
   }
 
   eps <- .Machine$double.eps
@@ -304,7 +441,8 @@ compute_prediction_metrics <- function(fit, y, beta, variance) {
   objective <- log_likelihood - lambda * sum(abs(penalized_beta))
   list(
     log_likelihood_check = log_likelihood,
-    objective_check = objective
+    objective_check = objective,
+    prediction = prediction
   )
 }
 
@@ -314,6 +452,74 @@ safe_field <- function(obj, name, default = NA) {
   }
   default
 }
+
+fit_counter_fields <- c(
+  "sparseLogistic.folds",
+  "sparseLogistic.lambdaValues",
+  "sparseLogistic.ccdEpochs",
+  "sparseLogistic.activeSetOnlyEpochs",
+  "sparseLogistic.activeSetFullReconciliationSweeps",
+  "sparseLogistic.fullKktScans",
+  "sparseLogistic.strongRuleViolations",
+  "sparseLogistic.strongRuleNoReference",
+  "sparseLogistic.strongRuleReferenceUses",
+  "sparseLogistic.strongRuleFullSetBypasses",
+  "sparseLogistic.strongRuleScreenedColumns",
+  "sparseLogistic.strongRuleScreenedNnz",
+  "sparseLogistic.strongRuleKeptCurrentNonzero",
+  "sparseLogistic.strongRuleKeptReferenceNonzero",
+  "sparseLogistic.strongRuleKeptThresholdNonPositive",
+  "sparseLogistic.strongRuleKeptGradient",
+  "sparseLogistic.strongRuleActiveKktChecks",
+  "sparseLogistic.strongRuleActiveKktFailures",
+  "sparseLogistic.strongRuleActiveKktMaxViolation",
+  "sparseLogistic.gradientHessianCalls",
+  "sparseLogistic.updateCalls",
+  "sparseLogistic.kktGradientCalls",
+  "sparseLogistic.nnzGradientHessian",
+  "sparseLogistic.nnzUpdate",
+  "sparseLogistic.nnzKkt",
+  "sparseLogistic.gapSafeChecks",
+  "sparseLogistic.gapSafeDualFeasibleChecks",
+  "sparseLogistic.gapSafeScreenedColumns",
+  "sparseLogistic.gapSafeScreenedNnz",
+  "sparseLogistic.gapSafeEligibleColumns",
+  "sparseLogistic.gapSafeEligibleNnz",
+  "sparseLogistic.gapSafeTotalColumns",
+  "sparseLogistic.gapSafeTotalNnz",
+  "sparseLogistic.foldLocalBuildAttempts",
+  "sparseLogistic.foldLocalBuildSuccesses",
+  "sparseLogistic.foldLocalBuildFallbacks",
+  "sparseLogistic.foldLocalCopyFittedAttempts",
+  "sparseLogistic.foldLocalCopyFittedSourceReady",
+  "sparseLogistic.foldLocalCopyFittedSuccesses",
+  "sparseLogistic.foldLocalInitialComputeXBetaCalls",
+  "sparseLogistic.strongSetSizeMean",
+  "sparseLogistic.activeSetSizeMean",
+  "sparseLogistic.setSizeRecords",
+  "sparseLogistic.gradientHessianSeconds",
+  "sparseLogistic.updateSeconds",
+  "sparseLogistic.kktSeconds",
+  "sparseLogistic.screeningSeconds",
+  "sparseLogistic.setupSeconds",
+  "sparseLogistic.gapSafeSeconds",
+  "sparseLogistic.gapSafeMaxScreenedColumns",
+  "sparseLogistic.gapSafeMaxScreenedNnz",
+  "sparseLogistic.gapSafeLastPrimalObjective",
+  "sparseLogistic.gapSafeLastDualObjective",
+  "sparseLogistic.gapSafeLastGap",
+  "sparseLogistic.gapSafeLastRadius",
+  "sparseLogistic.gapSafeLastDualScale",
+  "sparseLogistic.gapSafeMaxUnpenalizedGradient",
+  "sparseLogistic.foldLocalBuildSeconds",
+  "sparseLogistic.foldLocalDataBuildSeconds",
+  "sparseLogistic.foldLocalSpecificsBuildSeconds",
+  "sparseLogistic.foldLocalCcdSetupSeconds",
+  "sparseLogistic.foldLocalInitSeconds",
+  "sparseLogistic.foldLocalInitialComputeXBetaSeconds",
+  "sparseLogistic.cvBetaSyncSeconds",
+  "sparseLogistic.cvScoringSeconds"
+)
 
 fit_one <- function(data, kernel, repetition, args) {
   cyclops_data <- data$cyclops_data
@@ -330,7 +536,7 @@ fit_one <- function(data, kernel, repetition, args) {
   control <- Cyclops::createControl(
     maxIterations = args$max_iterations,
     tolerance = args$tolerance,
-    convergenceType = "gradient",
+    convergenceType = args$convergence_type,
     cvType = args$cv_type,
     fold = if (use_cv) args$folds else 1L,
     lowerLimit = args$lower_limit,
@@ -342,7 +548,17 @@ fit_one <- function(data, kernel, repetition, args) {
     threads = args$threads,
     seed = args$seed,
     resetCoefficients = FALSE,
-    logisticKernel = kernel
+    logisticKernel = kernel,
+    sparseConvergenceType = args$sparse_convergence_type,
+    sparseActiveKktTolerance = args$sparse_active_kkt_tolerance,
+    sparseActiveKktMovementTolerance = args$sparse_active_kkt_movement_tolerance,
+    sparseActiveKktPolishTolerance = args$sparse_active_kkt_polish_tolerance,
+    sparseActiveKktCheckEvery = args$sparse_active_kkt_check_every,
+    cvPolishPolicy = args$cv_polish_policy,
+    cvPolishTolerance = args$cv_polish_tolerance,
+    cvPolishMaxIterations = args$cv_polish_max_iterations,
+    cvPolishInitialCandidates = args$cv_polish_initial_candidates,
+    cvPolishStopProposal = args$cv_polish_stop_proposal
   )
 
   gc()
@@ -361,16 +577,31 @@ fit_one <- function(data, kernel, repetition, args) {
     error = function(e) rep(NA_real_, n_covariates)
   )
   variance <- as.numeric(safe_field(fit, "variance", args$variance))[1L]
-  checked <- compute_prediction_metrics(fit, y, beta, variance)
+  metric_x <- x
+  metric_beta <- beta
+  metric_source <- "fitted"
+  if (!is.null(data$reference_x)) {
+    metric_x <- data$reference_x
+    metric_beta <- expand_duplicate_beta(beta, data, data$reference_data)
+    metric_source <- "reference-expanded"
+  }
+  checked <- if (is.null(metric_x)) {
+    compute_prediction_metrics(fit, y, beta, variance)
+  } else {
+    compute_metrics(metric_x, y, metric_beta, variance)
+  }
   penalized_beta <- if (length(beta) == n_covariates) beta[-1L] else beta
 
-  data.frame(
+  row <- data.frame(
     kernel = kernel,
     repetition = repetition,
     mode = args$mode,
     rows = data$rows,
     features = data$features,
     nnz = data$nnz,
+    metric_source = metric_source,
+    metric_features = if (is.null(metric_x)) NA_integer_ else ncol(metric_x),
+    metric_nnz = if (is.null(metric_x)) NA_real_ else length(metric_x@x),
     elapsed_sec = as.numeric(elapsed["elapsed"]),
     user_sec = as.numeric(elapsed["user.self"]),
     system_sec = as.numeric(elapsed["sys.self"]),
@@ -379,18 +610,28 @@ fit_one <- function(data, kernel, repetition, args) {
     log_likelihood = as.numeric(safe_field(fit, "log_likelihood", NA_real_)),
     log_likelihood_check = checked$log_likelihood_check,
     objective_check = checked$objective_check,
+    kkt_max_violation = safe_field(checked, "kkt_max_violation", NA_real_),
+    kkt_intercept_violation = safe_field(checked, "kkt_intercept_violation", NA_real_),
+    kkt_active_violation = safe_field(checked, "kkt_active_violation", NA_real_),
+    kkt_inactive_violation = safe_field(checked, "kkt_inactive_violation", NA_real_),
     nonzero = sum(abs(penalized_beta) > 0, na.rm = TRUE),
     beta_l2 = sqrt(sum(beta * beta, na.rm = TRUE)),
     cross_validation = as.character(safe_field(fit, "cross_validation", "")),
     stringsAsFactors = FALSE
   )
+  for (field in fit_counter_fields) {
+    row[[field]] <- as.numeric(safe_field(fit, field, NA_real_))[1L]
+  }
+  list(row = row, prediction = checked$prediction)
 }
 
-add_comparisons <- function(results) {
+add_comparisons <- function(results, predictions) {
   out <- results
   out$speedup_vs_reference <- NA_real_
   out$objective_diff_vs_reference <- NA_real_
   out$log_likelihood_diff_vs_reference <- NA_real_
+  out$prediction_rmse_vs_reference <- NA_real_
+  out$prediction_max_abs_diff_vs_reference <- NA_real_
   for (rep in unique(out$repetition)) {
     rows <- which(out$repetition == rep)
     ref <- rows[1L]
@@ -399,6 +640,19 @@ add_comparisons <- function(results) {
       out$objective_check[rows] - out$objective_check[ref]
     out$log_likelihood_diff_vs_reference[rows] <-
       out$log_likelihood_check[rows] - out$log_likelihood_check[ref]
+    ref_prediction <- predictions[[ref]]
+    if (length(ref_prediction) == 1L && is.na(ref_prediction)) {
+      next
+    }
+    for (row in rows) {
+      prediction <- predictions[[row]]
+      if (length(prediction) != length(ref_prediction) || any(is.na(prediction))) {
+        next
+      }
+      diff <- prediction - ref_prediction
+      out$prediction_rmse_vs_reference[row] <- sqrt(mean(diff * diff))
+      out$prediction_max_abs_diff_vs_reference[row] <- max(abs(diff))
+    }
   }
   out
 }
@@ -431,8 +685,19 @@ main <- function() {
     data$rows <- nrow(data$x)
     data$features <- ncol(data$x)
     data$nnz <- length(data$x@x)
+    reference_data <- load_reference_matrix(args$reference_matrix_rds, data$y)
+    if (!is.null(reference_data)) {
+      data$reference_data <- reference_data
+      data$reference_x <- reference_data$x
+    }
     cat("Building Cyclops data...\n")
     data$cyclops_data <- make_cyclops_data(data$x, data$y)
+  } else {
+    reference_data <- load_reference_matrix(args$reference_matrix_rds, data$y)
+    if (!is.null(reference_data)) {
+      data$reference_data <- reference_data
+      data$reference_x <- reference_data$x
+    }
   }
 
   cat("Loaded data: rows=", data$rows,
@@ -445,18 +710,22 @@ main <- function() {
   for (rep in seq_len(args$repetitions)) {
     for (kernel in kernels) {
       cat("Fitting kernel=", kernel, " repetition=", rep, "...\n", sep = "")
-      results[[length(results) + 1L]] <- fit_one(
+      result <- fit_one(
         data = data,
         kernel = kernel,
         repetition = rep,
         args = args
       )
-      print(results[[length(results)]][, c("kernel", "elapsed_sec", "return_flag",
-                                           "variance", "nonzero")])
+      results[[length(results) + 1L]] <- result
+      print(result$row[, c("kernel", "elapsed_sec", "return_flag",
+                           "variance", "nonzero", "kkt_max_violation")])
     }
   }
 
-  out <- add_comparisons(do.call(rbind, results))
+  out <- add_comparisons(
+    do.call(rbind, lapply(results, `[[`, "row")),
+    lapply(results, `[[`, "prediction")
+  )
   write.csv(out, args$out, row.names = FALSE)
   cat("Wrote ", args$out, "\n", sep = "")
   print(out[, c("kernel", "repetition", "elapsed_sec", "speedup_vs_reference",

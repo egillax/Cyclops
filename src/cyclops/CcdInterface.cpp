@@ -70,6 +70,84 @@
 
 namespace bsccs {
 
+namespace {
+
+double parsePositiveEnvDouble(const char* name, double defaultValue) {
+	const char* value = std::getenv(name);
+	if (value == nullptr || value[0] == '\0') {
+		return defaultValue;
+	}
+	const double parsed = std::atof(value);
+	return parsed > 0.0 ? parsed : defaultValue;
+}
+
+int parsePositiveEnvInt(const char* name, int defaultValue) {
+	const char* value = std::getenv(name);
+	if (value == nullptr || value[0] == '\0') {
+		return defaultValue;
+	}
+	const int parsed = std::atoi(value);
+	return parsed > 0 ? parsed : defaultValue;
+}
+
+bool useCvPolish(const CCDArguments& arguments) {
+	const char* policyEnv = std::getenv("CYCLOPS_CV_POLISH_POLICY");
+	const std::string policy = policyEnv != nullptr
+			? std::string(policyEnv)
+			: arguments.crossValidation.polishPolicy;
+	const bool legacyEnvPolish = policyEnv == nullptr
+			&& std::getenv("CYCLOPS_CV_POLISH_TOLERANCE") != nullptr;
+	const double configuredTolerance = arguments.crossValidation.polishTolerance > 0.0
+			? arguments.crossValidation.polishTolerance
+			: arguments.modeFinding.tolerance;
+	const double polishTolerance = parsePositiveEnvDouble(
+			"CYCLOPS_CV_POLISH_TOLERANCE",
+			configuredTolerance);
+	return (policy != "none" || legacyEnvPolish)
+			&& polishTolerance > 0.0
+			&& polishTolerance < arguments.modeFinding.tolerance;
+}
+
+void writeFinalPolishTrace(
+		const char* path,
+		const ModeFindingArguments& baseArguments,
+		bool polishEnabled,
+		const ModeFindingArguments& polishArguments,
+		UpdateReturnFlags baseReturnFlag,
+		int baseIterations,
+		double baseConvergence,
+		UpdateReturnFlags finalReturnFlag,
+		int finalIterations,
+		double finalConvergence) {
+	if (path == nullptr || path[0] == '\0') {
+		return;
+	}
+	std::ofstream output(path);
+	if (!output) {
+		return;
+	}
+	output << "base_tolerance,base_max_iterations,base_sparse_convergence_type,"
+		   << "base_return_flag,base_iterations,base_convergence,"
+		   << "polish_enabled,polish_tolerance,polish_max_iterations,"
+		   << "polish_sparse_convergence_type,final_return_flag,final_iterations,"
+		   << "final_convergence\n";
+	output << baseArguments.tolerance << ","
+		   << baseArguments.maxIterations << ","
+		   << baseArguments.sparseConvergenceType << ","
+		   << static_cast<int>(baseReturnFlag) << ","
+		   << baseIterations << ","
+		   << baseConvergence << ","
+		   << (polishEnabled ? 1 : 0) << ","
+		   << polishArguments.tolerance << ","
+		   << polishArguments.maxIterations << ","
+		   << polishArguments.sparseConvergenceType << ","
+		   << static_cast<int>(finalReturnFlag) << ","
+		   << finalIterations << ","
+		   << finalConvergence << "\n";
+}
+
+} // namespace
+
 // using namespace TCLAP;
 using namespace std;
 
@@ -686,7 +764,6 @@ double CcdInterface::fitModel(CyclicCoordinateDescent *ccd) {
 		stream << "Using prior: " << ccd->getPriorInfo();
 		logger->writeLine(stream);
 	}
-
 	struct timeval time1, time2;
 	gettimeofday(&time1, NULL);
 
@@ -694,6 +771,41 @@ double CcdInterface::fitModel(CyclicCoordinateDescent *ccd) {
 	//std::vector<double> weights(7, 1.0);
 	//ccd->setWeights(weights.data());
 	ccd->update(arguments.modeFinding);
+	const UpdateReturnFlags baseReturnFlag = ccd->getUpdateReturnFlag();
+	const int baseIterations = ccd->getIterationCount();
+	const double baseConvergence = ccd->getLastConvergenceCriterion();
+	ModeFindingArguments polishArguments = arguments.modeFinding;
+	bool finalPolishEnabled = false;
+	if (baseReturnFlag == SUCCESS && useCvPolish(arguments)) {
+		polishArguments.sparseConvergenceType = "auto";
+		const double configuredTolerance = arguments.crossValidation.polishTolerance > 0.0
+				? arguments.crossValidation.polishTolerance
+				: arguments.modeFinding.tolerance;
+		polishArguments.tolerance = parsePositiveEnvDouble(
+				"CYCLOPS_FINAL_POLISH_TOLERANCE",
+				parsePositiveEnvDouble("CYCLOPS_CV_POLISH_TOLERANCE",
+						configuredTolerance));
+		const int configuredMaxIterations = arguments.crossValidation.polishMaxIterations > 0
+				? arguments.crossValidation.polishMaxIterations
+				: arguments.modeFinding.maxIterations;
+		polishArguments.maxIterations = parsePositiveEnvInt(
+				"CYCLOPS_FINAL_POLISH_MAX_ITERATIONS",
+				parsePositiveEnvInt("CYCLOPS_CV_POLISH_MAX_ITERATIONS",
+						configuredMaxIterations));
+		ccd->update(polishArguments);
+		finalPolishEnabled = true;
+	}
+	writeFinalPolishTrace(
+			std::getenv("CYCLOPS_FINAL_POLISH_TRACE"),
+			arguments.modeFinding,
+			finalPolishEnabled,
+			polishArguments,
+			baseReturnFlag,
+			baseIterations,
+			baseConvergence,
+			ccd->getUpdateReturnFlag(),
+			ccd->getIterationCount(),
+			ccd->getLastConvergenceCriterion());
 
 	gettimeofday(&time2, NULL);
 
@@ -780,6 +892,7 @@ double CcdInterface::runFitMLEAtMode(CyclicCoordinateDescent* ccd) {
 double CcdInterface::runCrossValidation(CyclicCoordinateDescent *ccd, AbstractModelData *modelData) {
 	struct timeval time1, time2;
 	gettimeofday(&time1, NULL);
+	ccd->resetSparseLogisticPerformanceCounters();
 
 	auto selectorType = getDefaultSelectorTypeOrOverride(
 		arguments.crossValidation.selectorType, modelData->getModelType());
@@ -886,4 +999,3 @@ bool CcdInterface::includesOption(const string& line, const string& option) {
 // }
 
 } // namespace
-

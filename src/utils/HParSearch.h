@@ -37,9 +37,17 @@ public:
         return best->second.m; }
     void tried( double x, double y, double y_stddev=0.0 ) //get to know next result (x,y)
     {
+        const bool replacesExisting = y_by_x.find(x) != y_by_x.end();
         y_by_x[x] = MS(y,y_stddev);
         if( y_by_x.size()==1 ) { //this is the first
             best = y_by_x.begin();
+        } else if (replacesExisting) {
+            best = y_by_x.begin();
+            for (std::map<double,MS>::const_iterator itr = y_by_x.begin();
+                    itr != y_by_x.end(); ++itr) {
+                if (itr->second.m > best->second.m)
+                    best = itr;
+            }
         } else {
 //            double improve = (y - best->second.m) / best->second.m;
             if( y > best->second.m )

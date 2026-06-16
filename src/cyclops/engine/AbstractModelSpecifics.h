@@ -80,11 +80,51 @@ public:
 		computeGradientAndHessian(index, ogradient, ohessian, useWeights);
 	}
 
-	virtual void updateSparseLogisticState(double realDelta, int index, bool useWeights) {
+	virtual double updateSparseLogisticState(double realDelta, int index, bool useWeights) {
 		updateXBeta(realDelta, index, useWeights);
+		return 0.0;
+	}
+
+	virtual size_t getSparseLogisticColumnScanSize(int index, bool useWeights) {
+		return 0;
+	}
+
+	virtual SparseLogisticPerformanceCounters getSparseLogisticPerformanceCounters() const {
+		return SparseLogisticPerformanceCounters();
+	}
+
+	virtual void resetSparseLogisticPerformanceCounters() {
+	}
+
+	virtual void addSparseLogisticKktScan(size_t nnz, double seconds) {
+	}
+
+	virtual GapSafeDiagnostic computeSparseLogisticGapSafeDiagnostic(
+			const std::vector<double>& boundaries,
+			const std::vector<bool>& fixedBeta,
+			const std::vector<double>& beta,
+			double penalty,
+			bool useWeights) {
+		return GapSafeDiagnostic();
 	}
 
 	virtual void syncSparseLogisticState() {
+	}
+
+	virtual bool initializeXBetaFromRowSubset(
+			const std::vector<double>& sourceXBeta,
+			const std::vector<int>& keptRows) {
+		return false;
+	}
+
+	virtual bool initializeSparseLogisticStateFromRowSubset(
+			const AbstractModelSpecifics& source,
+			const std::vector<int>& keptRows) {
+		return false;
+	}
+
+	virtual bool hasSparseLogisticStateReady() const {
+		return false;
 	}
 
 	virtual void computeThirdDerivative(int index, double *othird, bool useWeights) = 0; // pure virtual

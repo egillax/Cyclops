@@ -69,6 +69,11 @@ public:
 
 	CyclicCoordinateDescent* clone(ComputeDeviceArguments computeDevice);
 
+	CyclicCoordinateDescent* cloneFoldLocal(
+			const std::vector<double>& binaryTrainingWeights,
+			ComputeDeviceArguments computeDevice,
+			SparseLogisticPerformanceCounters* counters = nullptr);
+
 	void logResults(const char* fileName, bool withASE);
 
 	virtual ~CyclicCoordinateDescent();
@@ -82,6 +87,8 @@ public:
 	//double getPredictiveLogLikelihood(double* weights);
 
 	double getNewPredictiveLogLikelihood(double* weights);
+
+	double getPredictiveLogLikelihoodFromCurrentXBeta(double* weights);
 
 	void getPredictiveEstimates(double* y, double* weights) const;
 
@@ -146,6 +153,12 @@ public:
 //	template <typename T>
 	void setBeta(const std::vector<double>& beta);
 
+	void updateBetaFromVector(const std::vector<double>& beta);
+
+	void updateWarmStartStateFrom(const CyclicCoordinateDescent& source);
+
+	std::vector<double> getBetaVector() const;
+
 	void setStartingBeta(const std::vector<double>& inStartingBeta);
 
 	void setBeta(int i, double beta);
@@ -188,6 +201,10 @@ public:
 
 	int getIterationCount() const {
 		return lastIterationCount;
+	}
+
+	double getLastConvergenceCriterion() const {
+		return lastConvergenceCriterion;
 	}
 
 	void setNoiseLevel(NoiseLevels);
@@ -235,8 +252,21 @@ public:
 
 	void setHXBeta(void);
 
+	void resetSparseLogisticPerformanceCounters();
+
+	SparseLogisticPerformanceCounters getSparseLogisticPerformanceCounters() const;
+
+	void addSparseLogisticPerformanceCounters(const SparseLogisticPerformanceCounters& counters);
+
+	double computeSparseLogisticFullKktMaxViolation(
+		const LogisticKernelType logisticKernel);
+
+	double computeSparseLogisticNonzeroKktMaxViolation(
+		const LogisticKernelType logisticKernel);
+
 protected:
 
+	bsccs::unique_ptr<AbstractModelData> privateModelData;
 	bsccs::unique_ptr<AbstractModelSpecifics> privateModelSpecifics;
 
 	AbstractModelSpecifics& modelSpecifics;
@@ -245,7 +275,18 @@ protected:
 
 	CyclicCoordinateDescent(const CyclicCoordinateDescent& copy, ComputeDeviceArguments computeDevice);
 
-	void init(bool offset);
+	CyclicCoordinateDescent(
+			bsccs::unique_ptr<AbstractModelData> ownedModelData,
+			bsccs::unique_ptr<AbstractModelSpecifics> ownedModelSpecifics,
+			priors::JointPriorPtr prior,
+			loggers::ProgressLoggerPtr logger,
+				loggers::ErrorHandlerPtr error,
+				const CyclicCoordinateDescent& stateSource,
+				const std::vector<double>* sourceXBeta = nullptr,
+				const std::vector<int>* keptRows = nullptr,
+				SparseLogisticPerformanceCounters* counters = nullptr);
+
+	void init(bool offset, bool skipInitialZeroXBeta = false);
 
 	void resetBounds(void);
 
@@ -273,9 +314,9 @@ protected:
 
 	void computeSufficientStatistics(void);
 
-	void updateSufficientStatistics(double delta, int index);
+	double updateSufficientStatistics(double delta, int index);
 
-	void updateSufficientStatistics(double delta, int index, const LogisticKernelType logisticKernel);
+	double updateSufficientStatistics(double delta, int index, const LogisticKernelType logisticKernel);
 
 	void computeNumeratorForGradient(int index);
 
@@ -305,6 +346,13 @@ protected:
 	void computeGradientAndHessianForKernel(int index, priors::GradientHessian& gh,
 			const LogisticKernelType logisticKernel);
 
+	double computeGradientForKernel(int index, const LogisticKernelType logisticKernel);
+
+	double computeStrongActiveKktMaxViolation(
+		const std::vector<int>& activeIndices,
+		const std::vector<double>& boundaries,
+		const LogisticKernelType logisticKernel);
+
 	template <class IteratorType>
 	void computeGradientAndHessianImpl(
 			int index,
@@ -331,6 +379,37 @@ protected:
 
 	double ccdUpdateBeta(int index, const LogisticKernelType logisticKernel);
 
+	void findModeSparseLogisticStrong(
+		const int maxIterations, const int convergenceType, const double epsilon,
+		const AlgorithmType algorithmType, const int qQN, const bool doItAll,
+		const bool useActiveInnerSolver);
+
+	void maybeComputeSparseLogisticGapSafeDiagnostic(
+		const LogisticKernelType logisticKernel);
+
+	void findModeRestricted(
+		const std::vector<int>& activeIndices,
+		const int maxIterations, const int convergenceType, const double epsilon,
+		const AlgorithmType algorithmType, const int qQN, const bool doItAll,
+		const LogisticKernelType logisticKernel);
+
+	struct StrongRuleState {
+		bool valid = false;
+		double variance = 0.0;
+		double lambda = 0.0;
+		std::vector<double> gradients;
+		std::vector<double> boundaries;
+		std::vector<double> beta;
+	};
+
+	struct StrongRuleHistory {
+		std::vector<StrongRuleState> references;
+	};
+
+	StrongRuleHistory& getCurrentStrongRuleHistory();
+	void invalidateCurrentStrongRuleState();
+	const StrongRuleState* selectStrongRuleReference(double currentLambda) const;
+	void storeStrongRuleState(StrongRuleHistory& history, double variance, double lambda);
 
 	void mmUpdateAllBeta(std::vector<double>& allDelta,
                          const std::vector<bool>& fixedBeta);
@@ -421,9 +500,10 @@ protected:
 	bool sufficientStatisticsKnown;
 	bool xBetaKnown;
 	bool fisherInformationKnown;
-	bool varianceKnown;
+		bool varianceKnown;
+		std::vector<int> foldLocalSourceRows;
 
-	bool validWeights;
+		bool validWeights;
 	bool useCrossValidation;
 	bool doLogisticRegression;
 	DoubleVector hWeights; // Make DoubleVector and delegate to ModelSpecifics
@@ -434,6 +514,16 @@ protected:
 	NoiseLevels noiseLevel;
 	UpdateReturnFlags lastReturnFlag;
 	int lastIterationCount;
+	double lastConvergenceCriterion;
+	double lastCoordinateHessian;
+	double sparseLogisticEpochMaxCoordinateImpact;
+	double sparseLogisticEpochFittedChange;
+	std::string sparseLogisticConvergenceType;
+	double sparseLogisticActiveKktTolerance;
+	double sparseLogisticActiveKktMovementTolerance;
+	double sparseLogisticActiveKktPolishTolerance;
+	int sparseLogisticActiveKktCheckEvery;
+	SparseLogisticPerformanceCounters sparseLogisticPerformanceCounters;
 
 	Matrix hessianMatrix;
 	Matrix varianceMatrix;
@@ -466,6 +556,10 @@ protected:
 	bool usingCUDA;
 	bool streamCV = false;
 	int streamCVFolds;
+	int currentStrongRuleSlot = -1;
+	std::vector<StrongRuleHistory> strongRuleHistories;
+	bool suppressSparseLogisticLambdaCounter = false;
+	bool countSparseLogisticActiveSetEpoch = false;
 
 };
 

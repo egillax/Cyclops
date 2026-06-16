@@ -42,10 +42,15 @@ struct CrossValidationArguments {
 	std::string cvFileName;
 	bool doFitAtOptimal;
     double startingVariance;
-    SelectorType selectorType;
-    bool syncCV;
+	    SelectorType selectorType;
+	    bool syncCV;
+	    std::string polishPolicy;
+	    double polishTolerance;
+	    int polishMaxIterations;
+	    int polishInitialCandidates;
+	    bool polishStopProposal;
 
-    CrossValidationArguments() :
+	    CrossValidationArguments() :
         doCrossValidation(false),
         useAutoSearchCV(false),
         lowerLimit(0.01),
@@ -55,10 +60,15 @@ struct CrossValidationArguments {
         gridSteps(10),
         cvFileName("cv.txt"),
         doFitAtOptimal(true),
-        startingVariance(-1),   // Use default from Genkins et al.
-        selectorType(SelectorType::BY_PID),
-		syncCV(false)
-        { }
+	        startingVariance(-1),   // Use default from Genkins et al.
+	        selectorType(SelectorType::BY_PID),
+			syncCV(false),
+			polishPolicy("none"),
+			polishTolerance(-1.0),
+			polishMaxIterations(-1),
+			polishInitialCandidates(3),
+			polishStopProposal(true)
+	        { }
 };
 
 struct ComputeDeviceArguments {
@@ -81,23 +91,33 @@ struct ModeFindingArguments {
 	LogisticKernelType logisticKernel;
 	double initialBound;
 	int maxBoundCount;
-	bool doItAll;
-	AlgorithmType algorithmType;
+		bool doItAll;
+		AlgorithmType algorithmType;
+		std::string sparseConvergenceType;
+		double sparseActiveKktTolerance;
+		double sparseActiveKktMovementTolerance;
+		double sparseActiveKktPolishTolerance;
+		int sparseActiveKktCheckEvery;
 
-	ModeFindingArguments() :
-		tolerance(1E-6),
-		maxIterations(1000),
+		ModeFindingArguments() :
+			tolerance(1E-6),
+			maxIterations(1000),
 		convergenceTypeString("gradient"),
 		convergenceType(GRADIENT),
 		useKktSwindle(false),
 		swindleMultipler(10),
 		logisticKernel(LogisticKernelType::SPARSE_RESIDUAL),
-		initialBound(2.0),
-		maxBoundCount(5),
-		doItAll(true),
-		algorithmType(AlgorithmType::CCD)
-	    { }
-};
+			initialBound(2.0),
+			maxBoundCount(5),
+			doItAll(true),
+			algorithmType(AlgorithmType::CCD),
+			sparseConvergenceType("auto"),
+			sparseActiveKktTolerance(-1.0),
+			sparseActiveKktMovementTolerance(-1.0),
+			sparseActiveKktPolishTolerance(-1.0),
+			sparseActiveKktCheckEvery(1)
+		    { }
+	};
 
 struct CCDArguments {
 

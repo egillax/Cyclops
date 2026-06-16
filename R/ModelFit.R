@@ -617,7 +617,17 @@ print.cyclopsFit <- function(x, show.call=TRUE ,...) {
 #' @param algorithm             String: name of fitting algorithm to employ; default is `ccd`
 #' @param doItAll               Currently unused
 #' @param syncCV                Currently unused
-#' @param logisticKernel        String: logistic CCD kernel (\code{"auto"}, \code{"sparse-residual"}, \code{"legacy"})
+#' @param logisticKernel        String: logistic CCD kernel (\code{"auto"}, \code{"sparse-residual"}, \code{"sparse-residual-active"}, \code{"sparse-residual-strong"}, \code{"sparse-residual-active-strong"}, \code{"legacy"})
+#' @param sparseConvergenceType String: experimental sparse-logistic convergence criterion (\code{"auto"}, \code{"fitted-change"}, \code{"coordinate-impact"})
+#' @param sparseActiveKktTolerance Numeric: experimental active-coordinate KKT tolerance for sparse-logistic convergence; negative disables the gate
+#' @param sparseActiveKktMovementTolerance Numeric: experimental movement tolerance before active-KKT checks are allowed; negative uses \code{tolerance}
+#' @param sparseActiveKktPolishTolerance Numeric: experimental active-KKT tolerance for polish solves; negative reuses \code{sparseActiveKktTolerance}
+#' @param sparseActiveKktCheckEvery Integer: experimental active-KKT check period once the movement criterion is small enough
+#' @param cvPolishPolicy String: CV polish policy (\code{"none"}, \code{"selective"}, or \code{"all"})
+#' @param cvPolishTolerance Numeric: stricter tolerance used for CV polish and final selected-variance fit
+#' @param cvPolishMaxIterations Integer: maximum iterations for polish solves; negative reuses \code{maxIterations}
+#' @param cvPolishInitialCandidates Integer: number of initial auto-search candidates to polish under selective CV polish
+#' @param cvPolishStopProposal Logical: polish the final proposed auto-search stopping variance under selective CV polish
 #'
 #' Todo: Describe convegence types
 #'
@@ -650,7 +660,17 @@ createControl <- function(maxIterations = 1000,
                           algorithm = "ccd",
                           doItAll = TRUE,
                           syncCV = FALSE,
-                          logisticKernel = "auto") {
+                          logisticKernel = "auto",
+                          sparseConvergenceType = "auto",
+                          sparseActiveKktTolerance = -1,
+                          sparseActiveKktMovementTolerance = -1,
+                          sparseActiveKktPolishTolerance = -1,
+                          sparseActiveKktCheckEvery = 1,
+                          cvPolishPolicy = "none",
+                          cvPolishTolerance = -1,
+                          cvPolishMaxIterations = -1,
+                          cvPolishInitialCandidates = 1,
+                          cvPolishStopProposal = TRUE) {
     validCVNames = c("grid", "auto")
     stopifnot(cvType %in% validCVNames)
 
@@ -662,7 +682,26 @@ createControl <- function(maxIterations = 1000,
 
     validAlgorithmNames = c("ccd", "mm")
     stopifnot(algorithm %in% validAlgorithmNames)
-    stopifnot(logisticKernel %in% c("auto", "sparse-residual", "legacy"))
+    stopifnot(logisticKernel %in% c("auto", "sparse-residual", "sparse-residual-active", "sparse-residual-strong", "sparse-residual-active-strong", "legacy"))
+    stopifnot(sparseConvergenceType %in% c("auto", "fitted-change", "coordinate-impact"))
+    stopifnot(sparseActiveKktCheckEvery >= 1)
+    stopifnot(cvPolishPolicy %in% c("none", "selective", "all"))
+    stopifnot(cvPolishMaxIterations == -1 || cvPolishMaxIterations >= 1)
+    stopifnot(
+        is.numeric(cvPolishInitialCandidates) &&
+        length(cvPolishInitialCandidates) == 1 &&
+        !is.na(cvPolishInitialCandidates) &&
+        cvPolishInitialCandidates >= 0 &&
+        cvPolishInitialCandidates == as.integer(cvPolishInitialCandidates)
+    )
+    stopifnot(
+        is.logical(cvPolishStopProposal) &&
+        length(cvPolishStopProposal) == 1 &&
+        !is.na(cvPolishStopProposal)
+    )
+    if (cvPolishPolicy != "none") {
+        stopifnot(cvPolishTolerance > 0 && cvPolishTolerance < tolerance)
+    }
 
     structure(list(maxIterations = maxIterations,
                    tolerance = tolerance,
@@ -687,7 +726,17 @@ createControl <- function(maxIterations = 1000,
                    algorithm = algorithm,
                    doItAll = doItAll,
                    syncCV = syncCV,
-                   logisticKernel = logisticKernel),
+                   logisticKernel = logisticKernel,
+                   sparseConvergenceType = sparseConvergenceType,
+                   sparseActiveKktTolerance = sparseActiveKktTolerance,
+                   sparseActiveKktMovementTolerance = sparseActiveKktMovementTolerance,
+                   sparseActiveKktPolishTolerance = sparseActiveKktPolishTolerance,
+                   sparseActiveKktCheckEvery = sparseActiveKktCheckEvery,
+                   cvPolishPolicy = cvPolishPolicy,
+                   cvPolishTolerance = cvPolishTolerance,
+                   cvPolishMaxIterations = cvPolishMaxIterations,
+                   cvPolishInitialCandidates = cvPolishInitialCandidates,
+                   cvPolishStopProposal = cvPolishStopProposal),
               class = "cyclopsControl")
 }
 
@@ -840,6 +889,36 @@ getCrossValidationInfo <- function(object) {
         if (is.null(control$logisticKernel) || is.na(control$logisticKernel)) {
             control$logisticKernel <- "auto"
         }
+        if (is.null(control$sparseConvergenceType) || is.na(control$sparseConvergenceType)) {
+            control$sparseConvergenceType <- "auto"
+        }
+        if (is.null(control$sparseActiveKktTolerance) || is.na(control$sparseActiveKktTolerance)) {
+            control$sparseActiveKktTolerance <- -1
+        }
+        if (is.null(control$sparseActiveKktMovementTolerance) || is.na(control$sparseActiveKktMovementTolerance)) {
+            control$sparseActiveKktMovementTolerance <- -1
+        }
+        if (is.null(control$sparseActiveKktPolishTolerance) || is.na(control$sparseActiveKktPolishTolerance)) {
+            control$sparseActiveKktPolishTolerance <- -1
+        }
+        if (is.null(control$sparseActiveKktCheckEvery) || is.na(control$sparseActiveKktCheckEvery)) {
+            control$sparseActiveKktCheckEvery <- 1
+        }
+        if (is.null(control$cvPolishPolicy) || is.na(control$cvPolishPolicy)) {
+            control$cvPolishPolicy <- "none"
+        }
+        if (is.null(control$cvPolishTolerance) || is.na(control$cvPolishTolerance)) {
+            control$cvPolishTolerance <- -1
+        }
+        if (is.null(control$cvPolishMaxIterations) || is.na(control$cvPolishMaxIterations)) {
+            control$cvPolishMaxIterations <- -1
+        }
+        if (is.null(control$cvPolishInitialCandidates) || is.na(control$cvPolishInitialCandidates)) {
+            control$cvPolishInitialCandidates <- 1
+        }
+        if (is.null(control$cvPolishStopProposal) || is.na(control$cvPolishStopProposal)) {
+            control$cvPolishStopProposal <- TRUE
+        }
 
         .cyclopsSetControl(cyclopsInterfacePtr, control$maxIterations, control$tolerance,
                            control$convergenceType, control$autoSearch, control$fold,
@@ -849,7 +928,13 @@ getCrossValidationInfo <- function(object) {
                            control$startingVariance, control$useKKTSwindle, control$tuneSwindle,
                            control$selectorType, control$initialBound, control$maxBoundCount,
                            control$algorithm, control$doItAll, control$syncCV,
-                           control$logisticKernel
+                           control$logisticKernel, control$sparseConvergenceType,
+                           control$sparseActiveKktTolerance, control$sparseActiveKktMovementTolerance,
+                           control$sparseActiveKktPolishTolerance, control$sparseActiveKktCheckEvery,
+                           control$cvPolishPolicy, control$cvPolishTolerance,
+                           control$cvPolishMaxIterations,
+                           control$cvPolishInitialCandidates,
+                           control$cvPolishStopProposal
                           )
         return(control)
     }

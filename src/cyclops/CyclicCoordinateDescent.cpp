@@ -15,6 +15,9 @@
 #include <time.h>
 #include <set>
 #include <list>
+#include <chrono>
+#include <limits>
+#include <algorithm>
 
 //#include "Rcpp.h"
 
@@ -28,21 +31,81 @@ namespace bsccs {
 
 using namespace std; // TODO Bad form
 
+namespace {
+
+bool isSparseResidualKernel(const LogisticKernelType logisticKernel) {
+	return logisticKernel == LogisticKernelType::SPARSE_RESIDUAL
+			|| logisticKernel == LogisticKernelType::SPARSE_RESIDUAL_ACTIVE
+			|| logisticKernel == LogisticKernelType::SPARSE_RESIDUAL_STRONG
+			|| logisticKernel == LogisticKernelType::SPARSE_RESIDUAL_ACTIVE_STRONG;
+}
+
+bool useSparseCoordinateImpactConvergence(const std::string& convergenceType) {
+	const char* value = std::getenv("CYCLOPS_SPARSE_CONVERGENCE");
+	return (value != nullptr && std::string(value) == "coordinate-impact")
+			|| (value == nullptr && convergenceType == "coordinate-impact");
+}
+
+bool useSparseFittedChangeConvergence(const std::string& convergenceType) {
+	const char* value = std::getenv("CYCLOPS_SPARSE_CONVERGENCE");
+	return (value != nullptr && std::string(value) == "fitted-change")
+			|| (value == nullptr && convergenceType == "fitted-change");
+}
+
+bool useSparseActiveKktRepair() {
+	const char* value = std::getenv("CYCLOPS_SPARSE_ACTIVE_KKT_REPAIR");
+	return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+bool useSparseConvergenceActiveKktGate(double activeKktTolerance) {
+	const char* value = std::getenv("CYCLOPS_SPARSE_CONVERGENCE_ACTIVE_KKT_TOLERANCE");
+	return (value != nullptr && value[0] != '\0')
+			|| activeKktTolerance >= 0.0;
+}
+
+double parseEnvDouble(const char* name, double defaultValue) {
+	const char* value = std::getenv(name);
+	if (value == nullptr || value[0] == '\0') {
+		return defaultValue;
+	}
+	return std::atof(value);
+}
+
+double parsePositiveEnvDouble(const char* name, double defaultValue) {
+	const char* value = std::getenv(name);
+	if (value == nullptr || value[0] == '\0') {
+		return defaultValue;
+	}
+	const double parsed = std::atof(value);
+	return parsed > 0.0 ? parsed : defaultValue;
+}
+
+int parsePositiveEnvInt(const char* name, int defaultValue) {
+	const char* value = std::getenv(name);
+	if (value == nullptr || value[0] == '\0') {
+		return defaultValue;
+	}
+	const int parsed = std::atoi(value);
+	return parsed > 0 ? parsed : defaultValue;
+}
+
+}
+
 CyclicCoordinateDescent::CyclicCoordinateDescent(
 			//ModelData* reader,
 			const AbstractModelData& reader,
 			AbstractModelSpecifics& specifics,
-			priors::JointPriorPtr prior,
-			loggers::ProgressLoggerPtr _logger,
-			loggers::ErrorHandlerPtr _error
-		) : privateModelSpecifics(nullptr), modelSpecifics(specifics), jointPrior(prior),
+		priors::JointPriorPtr prior,
+		loggers::ProgressLoggerPtr _logger,
+		loggers::ErrorHandlerPtr _error
+		) : privateModelData(nullptr), privateModelSpecifics(nullptr), modelSpecifics(specifics), jointPrior(prior),
 		 hXI(reader), // hXBeta(modelSpecifics.getXBeta()), hXBetaSave(modelSpecifics.getXBetaSave()), // TODO Remove
 		 logger(_logger), error(_error) {
 	N = hXI.getNumberOfPatients();
 	K = hXI.getNumberOfRows();
 	J = hXI.getNumberOfCovariates();
 
-// 	hXI = reader;
+//	hXI = reader;
 	// hY = hXI.getYVector(); // TODO Delegate all data to ModelSpecifics
 //	hOffs = reader->getOffsetVector();
 	// hPid = hXI.getPidVector();
@@ -51,6 +114,8 @@ CyclicCoordinateDescent::CyclicCoordinateDescent(
 
 	updateCount = 0;
 	likelihoodCount = 0;
+	lastIterationCount = 0;
+	lastConvergenceCriterion = std::numeric_limits<double>::quiet_NaN();
 	noiseLevel = NOISY;
 	initialBound = 2.0;
 
@@ -63,17 +128,105 @@ CyclicCoordinateDescent* CyclicCoordinateDescent::clone(ComputeDeviceArguments c
 	return new (std::nothrow) CyclicCoordinateDescent(*this, computeDevice);
 }
 
+CyclicCoordinateDescent* CyclicCoordinateDescent::cloneFoldLocal(
+		const std::vector<double>& binaryTrainingWeights,
+		ComputeDeviceArguments computeDevice,
+		SparseLogisticPerformanceCounters* counters) {
+	if (GPU()) {
+		return nullptr;
+	}
+
+	bsccs::unique_ptr<AbstractModelData> foldData;
+	std::vector<int> keptRows;
+	const auto dataBuildStart = std::chrono::steady_clock::now();
+	if (hXI.getPrecisionType() == PrecisionType::FP32) {
+		const auto* source = dynamic_cast<const ModelData<float>*>(&hXI);
+		if (source == nullptr) {
+			return nullptr;
+		}
+		foldData.reset(source->createRowSubsetFromBinaryWeights(
+				binaryTrainingWeights, false, &keptRows));
+	} else {
+		const auto* source = dynamic_cast<const ModelData<double>*>(&hXI);
+		if (source == nullptr) {
+			return nullptr;
+		}
+		foldData.reset(source->createRowSubsetFromBinaryWeights(
+				binaryTrainingWeights, false, &keptRows));
+	}
+	const auto dataBuildEnd = std::chrono::steady_clock::now();
+	if (counters != nullptr) {
+		counters->foldLocalDataBuildSeconds +=
+				std::chrono::duration<double>(dataBuildEnd - dataBuildStart).count();
+	}
+
+	if (!foldData) {
+		return nullptr;
+	}
+
+	DeviceType deviceType = computeDevice.name == "native" ? DeviceType::CPU : DeviceType::GPU;
+	const auto specificsBuildStart = std::chrono::steady_clock::now();
+	auto foldSpecifics = bsccs::unique_ptr<AbstractModelSpecifics>(
+			AbstractModelSpecifics::factory(
+					foldData->getModelType(),
+					*foldData,
+					deviceType,
+					computeDevice.name));
+	const auto specificsBuildEnd = std::chrono::steady_clock::now();
+	if (counters != nullptr) {
+		counters->foldLocalSpecificsBuildSeconds +=
+				std::chrono::duration<double>(specificsBuildEnd - specificsBuildStart).count();
+	}
+	if (!foldSpecifics) {
+		return nullptr;
+	}
+
+	const auto ccdSetupStart = std::chrono::steady_clock::now();
+	static const bool copyXBetaEnabled = []() {
+		const char* env = std::getenv("CYCLOPS_FOLD_LOCAL_COPY_XBETA");
+		return env != nullptr && env[0] != '\0' && env[0] != '0';
+	}();
+	static const bool copyFittedEnabled = []() {
+		const char* env = std::getenv("CYCLOPS_FOLD_LOCAL_COPY_FITTED");
+		return env != nullptr && env[0] != '\0' && env[0] != '0';
+	}();
+	if (copyFittedEnabled && xBetaKnown && !modelSpecifics.hasSparseLogisticStateReady()) {
+		modelSpecifics.refreshSparseLogisticState(false);
+	}
+	const std::vector<double> sourceXBeta =
+			copyXBetaEnabled ? modelSpecifics.getXBeta() : std::vector<double>();
+	const std::vector<double>* sourceXBetaPtr =
+			copyXBetaEnabled ? &sourceXBeta : nullptr;
+	auto* clone = new (std::nothrow) CyclicCoordinateDescent(
+			std::move(foldData),
+			std::move(foldSpecifics),
+			jointPrior,
+			logger,
+				error,
+				*this,
+				sourceXBetaPtr,
+				&keptRows,
+				counters);
+	const auto ccdSetupEnd = std::chrono::steady_clock::now();
+	if (counters != nullptr) {
+		counters->foldLocalCcdSetupSeconds +=
+				std::chrono::duration<double>(ccdSetupEnd - ccdSetupStart).count();
+	}
+	return clone;
+}
+
 //template <typename T>
 //struct GetType<T>;
 CyclicCoordinateDescent::CyclicCoordinateDescent(const CyclicCoordinateDescent& copy, ComputeDeviceArguments computeDevice)
-	: privateModelSpecifics(
+	: privateModelData(nullptr),
+	  privateModelSpecifics(
 			bsccs::unique_ptr<AbstractModelSpecifics>(
 				copy.modelSpecifics.clone(computeDevice))), // deep copy
 	  modelSpecifics(*privateModelSpecifics),
       jointPrior(copy.jointPrior), // swallow
       hXI(copy.hXI), // swallow
-// 	  hXBeta(modelSpecifics.getXBeta()), hXBetaSave(modelSpecifics.getXBetaSave()), // TODO Remove
-// 	  jointPrior(priors::JointPriorPtr(copy.jointPrior->clone())), // deep copy
+//	  hXBeta(modelSpecifics.getXBeta()), hXBetaSave(modelSpecifics.getXBetaSave()), // TODO Remove
+//	  jointPrior(priors::JointPriorPtr(copy.jointPrior->clone())), // deep copy
 	  logger(copy.logger), error(copy.error) {
 
 	N = hXI.getNumberOfPatients();
@@ -87,6 +240,8 @@ CyclicCoordinateDescent::CyclicCoordinateDescent(const CyclicCoordinateDescent& 
 
 	updateCount = 0;
 	likelihoodCount = 0;
+	lastIterationCount = 0;
+	lastConvergenceCriterion = std::numeric_limits<double>::quiet_NaN();
 	noiseLevel = copy.noiseLevel;
 	initialBound = copy.initialBound;
 
@@ -137,12 +292,12 @@ CyclicCoordinateDescent::~CyclicCoordinateDescent(void) {
 //	free(hDelta);
 
 // #ifdef TEST_ROW_INDEX
-// 	for (int j = 0; j < J; ++j) {
-// 		if (hXColumnRowIndicators[j]) {
-// 			free(hXColumnRowIndicators[j]);
-// 		}
-// 	}
-// 	free(hXColumnRowIndicators);
+//	for (int j = 0; j < J; ++j) {
+//		if (hXColumnRowIndicators[j]) {
+//			free(hXColumnRowIndicators[j]);
+//		}
+//	}
+//	free(hXColumnRowIndicators);
 // #endif
 
 //	free(hXjY);
@@ -153,20 +308,20 @@ CyclicCoordinateDescent::~CyclicCoordinateDescent(void) {
 //	free(t1);
 
 // #ifdef NO_FUSE
-// 	free(wPid);
+//	free(wPid);
 // #endif
 
-// 	if (hWeights) {
-// 		free(hWeights);
-// 	}
+//	if (hWeights) {
+//		free(hWeights);
+//	}
 
 #ifdef SPARSE_PRODUCT
-// 	for (std::vector<std::vector<int>* >::iterator it = sparseIndices.begin();
-// 			it != sparseIndices.end(); ++it) {
-// 		if (*it) {
-// 			delete *it;
-// 		}
-// 	}
+//	for (std::vector<std::vector<int>* >::iterator it = sparseIndices.begin();
+//			it != sparseIndices.end(); ++it) {
+//		if (*it) {
+//			delete *it;
+//		}
+//	}
 #endif
 }
 
@@ -216,7 +371,107 @@ void CyclicCoordinateDescent::resetBounds() {
 	}
 }
 
-void CyclicCoordinateDescent::init(bool offset) {
+CyclicCoordinateDescent::CyclicCoordinateDescent(
+		bsccs::unique_ptr<AbstractModelData> ownedModelData,
+		bsccs::unique_ptr<AbstractModelSpecifics> ownedModelSpecifics,
+		priors::JointPriorPtr prior,
+		loggers::ProgressLoggerPtr _logger,
+			loggers::ErrorHandlerPtr _error,
+			const CyclicCoordinateDescent& stateSource,
+			const std::vector<double>* sourceXBeta,
+			const std::vector<int>* keptRows,
+			SparseLogisticPerformanceCounters* counters)
+	: privateModelData(std::move(ownedModelData)),
+	  privateModelSpecifics(std::move(ownedModelSpecifics)),
+	  modelSpecifics(*privateModelSpecifics),
+	  jointPrior(prior),
+	  hXI(*privateModelData),
+	  logger(_logger),
+	  error(_error) {
+
+	N = hXI.getNumberOfPatients();
+	K = hXI.getNumberOfRows();
+	J = hXI.getNumberOfCovariates();
+
+	updateCount = 0;
+	likelihoodCount = 0;
+	lastIterationCount = 0;
+	lastConvergenceCriterion = std::numeric_limits<double>::quiet_NaN();
+	noiseLevel = stateSource.noiseLevel;
+	initialBound = stateSource.initialBound;
+	priorType = stateSource.priorType;
+	usingGPU = false;
+	usingCUDA = false;
+	syncCV = false;
+	streamCV = false;
+	streamCVFolds = 0;
+
+	static const bool skipInitialZeroXBeta = []() {
+		const char* env = std::getenv("CYCLOPS_FOLD_LOCAL_SKIP_INITIAL_ZERO_XBETA");
+		return env != nullptr && env[0] != '\0' && env[0] != '0';
+	}();
+	const auto initStart = std::chrono::steady_clock::now();
+	init(hXI.getHasOffsetCovariate(), skipInitialZeroXBeta);
+	const auto initEnd = std::chrono::steady_clock::now();
+	if (counters != nullptr) {
+		counters->foldLocalInitSeconds +=
+				std::chrono::duration<double>(initEnd - initStart).count();
+	}
+	if (keptRows != nullptr) {
+		foldLocalSourceRows = *keptRows;
+	}
+
+	bool allBetaZero = true;
+	for (int j = 0; j < J; ++j) {
+		hBeta[j] = stateSource.hBeta[j];
+		startingBeta[j] = stateSource.startingBeta[j];
+		fixBeta[j] = stateSource.fixBeta[j];
+		if (hBeta[j] != 0.0) {
+			allBetaZero = false;
+		}
+	}
+
+	static const bool copyFittedEnabled = []() {
+		const char* env = std::getenv("CYCLOPS_FOLD_LOCAL_COPY_FITTED");
+		return env != nullptr && env[0] != '\0' && env[0] != '0';
+	}();
+	if (copyFittedEnabled && counters != nullptr) {
+		counters->foldLocalCopyFittedAttempts += 1;
+		if (stateSource.modelSpecifics.hasSparseLogisticStateReady()) {
+			counters->foldLocalCopyFittedSourceReady += 1;
+		}
+	}
+	const bool copiedFitted = copyFittedEnabled
+			&& keptRows != nullptr
+			&& modelSpecifics.initializeSparseLogisticStateFromRowSubset(
+					stateSource.modelSpecifics, *keptRows);
+	if (copiedFitted && counters != nullptr) {
+		counters->foldLocalCopyFittedSuccesses += 1;
+	}
+	const bool copiedXBeta = sourceXBeta != nullptr
+			&& keptRows != nullptr
+			&& modelSpecifics.initializeXBetaFromRowSubset(*sourceXBeta, *keptRows);
+
+	if (copiedFitted || copiedXBeta || allBetaZero) {
+		xBetaKnown = true;
+		sufficientStatisticsKnown = copiedFitted;
+		fisherInformationKnown = false;
+		varianceKnown = false;
+	} else {
+		makeDirty();
+		const auto computeXBetaStart = std::chrono::steady_clock::now();
+		computeXBeta();
+		const auto computeXBetaEnd = std::chrono::steady_clock::now();
+		if (counters != nullptr) {
+			counters->foldLocalInitialComputeXBetaCalls += 1;
+			counters->foldLocalInitialComputeXBetaSeconds +=
+					std::chrono::duration<double>(
+							computeXBetaEnd - computeXBetaStart).count();
+		}
+	}
+}
+
+void CyclicCoordinateDescent::init(bool offset, bool skipInitialZeroXBeta) {
 
 	// Set parameters and statistics space
 	hDelta.resize(J, static_cast<double>(initialBound));
@@ -225,8 +480,8 @@ void CyclicCoordinateDescent::init(bool offset) {
 	// initialize starting betas to default value 0.0
 	startingBeta.resize(J, static_cast<double>(0.0));
 
-// 	hXBeta.resize(K, static_cast<double>(0.0));
-// 	hXBetaSave.resize(K, static_cast<double>(0.0));
+//	hXBeta.resize(K, static_cast<double>(0.0));
+//	hXBetaSave.resize(K, static_cast<double>(0.0));
 
 	fixBeta.resize(J, false);
 
@@ -238,6 +493,16 @@ void CyclicCoordinateDescent::init(bool offset) {
 	sufficientStatisticsKnown = false;
 	fisherInformationKnown = false;
 	varianceKnown = false;
+	lastIterationCount = 0;
+	lastConvergenceCriterion = std::numeric_limits<double>::quiet_NaN();
+	lastCoordinateHessian = 0.0;
+	sparseLogisticEpochMaxCoordinateImpact = 0.0;
+	sparseLogisticEpochFittedChange = 0.0;
+	sparseLogisticConvergenceType = "auto";
+	sparseLogisticActiveKktTolerance = -1.0;
+	sparseLogisticActiveKktMovementTolerance = -1.0;
+	sparseLogisticActiveKktPolishTolerance = -1.0;
+	sparseLogisticActiveKktCheckEvery = 1;
 	if (offset) {
 		hBeta[0] = static_cast<double>(1);
 		startingBeta[0] = static_cast<double>(1);
@@ -263,7 +528,15 @@ void CyclicCoordinateDescent::init(bool offset) {
 
 	usingGPU = modelSpecifics.isGPU();
 	usingCUDA = modelSpecifics.isCUDA();
-	resetBeta();
+	if (skipInitialZeroXBeta && !offset && !usingGPU && !usingCUDA) {
+		modelSpecifics.zeroXBeta();
+		xBetaKnown = true;
+		sufficientStatisticsKnown = false;
+		fisherInformationKnown = false;
+		varianceKnown = false;
+	} else {
+		resetBeta();
+	}
 }
 
 int CyclicCoordinateDescent::getAlignedLength(int N) {
@@ -300,12 +573,12 @@ void CyclicCoordinateDescent::resetBeta(void) {
     auto start = hXI.getHasOffsetCovariate() ? 1 : 0;
     for (auto j = start; j < J; j++) {
 
-    	// check if a non-zero starting beta is present
-    	if (startingBeta[j] != 0.0) {
-    		hBeta[j] = startingBeta[j];
-    	} else {
-    		hBeta[j] = 0.0;
-    	}
+	// check if a non-zero starting beta is present
+	if (startingBeta[j] != 0.0) {
+		hBeta[j] = startingBeta[j];
+	} else {
+		hBeta[j] = 0.0;
+	}
     }
 	if (usingGPU || usingCUDA) {
 		modelSpecifics.resetBeta();
@@ -371,23 +644,41 @@ double CyclicCoordinateDescent::getNewPredictiveLogLikelihood(double* weights) {
 
 //     std::vector<double> savedWeights;
 //
-// 	if (weights != nullptr) {
-// 	    savedWeights = hWeights; // Save original
-// 	    setWeights(weights);
-// 	    // modelSpecifics.setWeights(weights, true);
-// 	}
+//	if (weights != nullptr) {
+//	    savedWeights = hWeights; // Save original
+//	    setWeights(weights);
+//	    // modelSpecifics.setWeights(weights, true);
+//	}
 //
-// 	auto result = getLogLikelihood();
-// 	// auto result = modelSpecifics.getPredictiveLogLikelihood(weights);
+//	auto result = getLogLikelihood();
+//	// auto result = modelSpecifics.getPredictiveLogLikelihood(weights);
 //
-// 	if (weights != nullptr) {
-// 	    setWeights(savedWeights.data());
-// 	    // modelSpecifics.setWeights(savedWeights.data(), true);
-// 	}
+//	if (weights != nullptr) {
+//	    setWeights(savedWeights.data());
+//	    // modelSpecifics.setWeights(savedWeights.data(), true);
+//	}
 //
-// 	return result;
+//	return result;
 
     xBetaKnown = false;
+
+    if (!xBetaKnown) {
+        computeXBeta();
+        xBetaKnown = true;
+        sufficientStatisticsKnown = false;
+    }
+
+    if (!sufficientStatisticsKnown) {
+        computeRemainingStatistics(true, 0); // TODO Remove index????
+        sufficientStatisticsKnown = true;
+    }
+
+    getDenominators();
+
+    return modelSpecifics.getPredictiveLogLikelihood(weights); // TODO Pass double
+}
+
+double CyclicCoordinateDescent::getPredictiveLogLikelihoodFromCurrentXBeta(double* weights) {
 
     if (!xBetaKnown) {
         computeXBeta();
@@ -536,6 +827,57 @@ void CyclicCoordinateDescent::setBeta(const std::vector<double>& beta) {
 	varianceKnown = false;
 }
 
+void CyclicCoordinateDescent::updateBetaFromVector(const std::vector<double>& beta) {
+	if (static_cast<int>(beta.size()) != J) {
+		std::ostringstream stream;
+		stream << "Mismatched beta vector length";
+		error->throwError(stream);
+	}
+
+	if (!xBetaKnown) {
+		setBeta(beta);
+		return;
+	}
+
+	for (int j = 0; j < J; ++j) {
+		if (hBeta[j] != beta[j]) {
+			setBeta(j, beta[j]);
+		}
+	}
+	sufficientStatisticsKnown = false;
+}
+
+void CyclicCoordinateDescent::updateWarmStartStateFrom(const CyclicCoordinateDescent& source) {
+	static const bool copyXBetaEnabled = []() {
+		const char* env = std::getenv("CYCLOPS_FOLD_LOCAL_COPY_XBETA_WARM");
+		return env != nullptr && env[0] != '\0' && env[0] != '0';
+	}();
+	bool copiedXBeta = false;
+	if (copyXBetaEnabled && !foldLocalSourceRows.empty() && source.xBetaKnown) {
+		setBeta(source.getBetaVector());
+		const std::vector<double> sourceXBeta =
+				const_cast<CyclicCoordinateDescent&>(source).modelSpecifics.getXBeta();
+		copiedXBeta = modelSpecifics.initializeXBetaFromRowSubset(
+				sourceXBeta, foldLocalSourceRows);
+		if (copiedXBeta) {
+			xBetaKnown = true;
+			sufficientStatisticsKnown = false;
+			fisherInformationKnown = false;
+			varianceKnown = false;
+		}
+	}
+	if (!copiedXBeta) {
+		updateBetaFromVector(source.getBetaVector());
+	}
+	if (source.hDelta.size() == hDelta.size()) {
+		hDelta = source.hDelta;
+	}
+}
+
+std::vector<double> CyclicCoordinateDescent::getBetaVector() const {
+	return hBeta;
+}
+
 void CyclicCoordinateDescent::getHBeta(void) {
 	if (usingCUDA) {
 		hBeta = modelSpecifics.getBeta();
@@ -581,6 +923,7 @@ std::vector<double> CyclicCoordinateDescent::getCensorWeights() {
 void CyclicCoordinateDescent::setWeights(double* iWeights) {
 
 	if (iWeights == NULL) {
+		currentStrongRuleSlot = -1;
 		if (hWeights.size() != 0) {
 			hWeights.resize(0);
 		}
@@ -635,9 +978,9 @@ double CyclicCoordinateDescent::getObjectiveFunction(int convergenceType) {
 	} else if (convergenceType == ONE_STEP) {
 	    return 0.0;
 	} else {
-    	std::ostringstream stream;
-    	stream << "Invalid convergence type: " << convergenceType;
-    	error->throwError(stream);
+	std::ostringstream stream;
+	stream << "Invalid convergence type: " << convergenceType;
+	error->throwError(stream);
     }
     return 0.0;
 }
@@ -679,6 +1022,11 @@ void CyclicCoordinateDescent::update(const ModeFindingArguments& arguments) {
 	const int qnQ = 0;
 
 	initialBound = arguments.initialBound;
+	sparseLogisticConvergenceType = arguments.sparseConvergenceType;
+	sparseLogisticActiveKktTolerance = arguments.sparseActiveKktTolerance;
+	sparseLogisticActiveKktMovementTolerance = arguments.sparseActiveKktMovementTolerance;
+	sparseLogisticActiveKktPolishTolerance = arguments.sparseActiveKktPolishTolerance;
+	sparseLogisticActiveKktCheckEvery = arguments.sparseActiveKktCheckEvery;
 
 	int count = 0;
 	bool done = false;
@@ -726,9 +1074,9 @@ void CyclicCoordinateDescent::findMode(Iterator begin, Iterator end,
 		const AlgorithmType algorithmType, const int qnQ, const bool doItAll) {
 
 	std::fill(fixBeta.begin(), fixBeta.end(), true);
- 	std::for_each(begin, end, [this] (ScoreTuple& tuple) {
- 		fixBeta[std::get<0>(tuple)] = false;
- 	});
+	std::for_each(begin, end, [this] (ScoreTuple& tuple) {
+		fixBeta[std::get<0>(tuple)] = false;
+	});
 	findMode(maxIterations, convergenceType, epsilon, algorithmType, qnQ, doItAll,
 			LogisticKernelType::LEGACY);
     // fixBeta is no longer valid
@@ -763,7 +1111,7 @@ void CyclicCoordinateDescent::kktSwindle(const ModeFindingArguments& arguments) 
 		} else {
 			if (index == intercept || // Always place intercept into active set
                 !jointPrior->getSupportsKktSwindle(index)) {
-// 				activeSet.push_back(index);
+//				activeSet.push_back(index);
 				activeSet.push_back(std::make_tuple(index, 0.0, true));
 			} else {
 				inactiveSet.push_back(std::make_tuple(index, 0.0, false));
@@ -852,42 +1200,42 @@ void CyclicCoordinateDescent::kktSwindle(const ModeFindingArguments& arguments) 
 
 
 					// Remove elements from activeSet if less than 90% of boundary
-// 					computeKktConditions(activeSet); // TODO Already computed in findMode
+//					computeKktConditions(activeSet); // TODO Already computed in findMode
 //
-// // 					for (auto& active : activeSet) {
-// // 						std::ostringstream stream;
-// // 						stream << "Active: " << std::get<0>(active) << " : " << std::get<1>(active) << " : " << std::get<2>(active);
-// // 						logger->writeLine(stream);
-// // 					}
+// //					for (auto& active : activeSet) {
+// //						std::ostringstream stream;
+// //						stream << "Active: " << std::get<0>(active) << " : " << std::get<1>(active) << " : " << std::get<2>(active);
+// //						logger->writeLine(stream);
+// //					}
 //
-// 					int countActiveViolations = 0;
-// 					while(activeSet.size() > 0 &&
-// 						checkAlmostConditions(activeSet.back())
-// 					) {
-// 						auto& back = activeSet.back();
+//					int countActiveViolations = 0;
+//					while(activeSet.size() > 0 &&
+//						checkAlmostConditions(activeSet.back())
+//					) {
+//						auto& back = activeSet.back();
 //
-// // 						std::ostringstream stream;
-// // 						stream << "Remove: " << std::get<0>(back) << ":" << std::get<1>(back)
-// // 						       << " cut @ " << jointPrior->getKktBoundary(std::get<0>(back))
-// // 						       << " diff = " << (std::get<1>(back) - jointPrior->getKktBoundary(std::get<0>(back)));
-// // 						logger->writeLine(stream);
+// //						std::ostringstream stream;
+// //						stream << "Remove: " << std::get<0>(back) << ":" << std::get<1>(back)
+// //						       << " cut @ " << jointPrior->getKktBoundary(std::get<0>(back))
+// //						       << " diff = " << (std::get<1>(back) - jointPrior->getKktBoundary(std::get<0>(back)));
+// //						logger->writeLine(stream);
 //
-// 						inactiveSet.push_back(back);
-// 						activeSet.pop_back();
-// 						++countActiveViolations;
-// 					}
+//						inactiveSet.push_back(back);
+//						activeSet.pop_back();
+//						++countActiveViolations;
+//					}
 					// end
 
 					// Move inactive elements into active if KKT conditions are not met
 					while (inactiveSet.size() > 0
 							&& !checkConditions(inactiveSet.front())
-//  							&& activeSet.size() < newActiveSize
+//							&& activeSet.size() < newActiveSize
 					) {
 						auto& front = inactiveSet.front();
 
-// 						std::ostringstream stream;
-// 						stream << std::get<0>(front) << ":" << std::get<1>(front);
-// 						logger->writeLine(stream);
+//						std::ostringstream stream;
+//						stream << std::get<0>(front) << ":" << std::get<1>(front);
+//						logger->writeLine(stream);
 
 						activeSet.push_back(front);
 						inactiveSet.pop_front();
@@ -895,7 +1243,7 @@ void CyclicCoordinateDescent::kktSwindle(const ModeFindingArguments& arguments) 
 
 					if (noiseLevel >= QUIET) {
 						std::ostringstream stream;
-// 						stream << "  Active set violations: " << countActiveViolations << std::endl;
+//						stream << "  Active set violations: " << countActiveViolations << std::endl;
 						stream << "Inactive set violations: " << (count1 - count2);
 						logger->writeLine(stream);
 					}
@@ -930,11 +1278,11 @@ void CyclicCoordinateDescent::computeKktConditions(Container& scoreSet) {
     }
 
     scoreSet.sort([] (ScoreTuple& lhs, ScoreTuple& rhs) -> bool {
-    	if (std::get<2>(rhs) == std::get<2>(lhs)) {
+	if (std::get<2>(rhs) == std::get<2>(lhs)) {
 			return (std::get<1>(rhs) < std::get<1>(lhs));
-    	} else {
-    		return(std::get<2>(lhs));
-    	}
+	} else {
+		return(std::get<2>(lhs));
+	}
     });
 }
 
@@ -977,6 +1325,7 @@ bool CyclicCoordinateDescent::performCheckConvergence(int convergenceType,
         saveXBeta();
     } // Necessary to call getObjFxn or computeZO before getLogLikelihood,
     // since these copy over XBeta
+	lastConvergenceCriterion = conv;
 
     double thisLogLikelihood = getLogLikelihood();
     double thisLogPrior = getLogPrior();
@@ -1079,14 +1428,28 @@ void CyclicCoordinateDescent::findMode(
 	}
 
 	const LogisticKernelType effectiveLogisticKernel =
-			(logisticKernel == LogisticKernelType::SPARSE_RESIDUAL
+			(isSparseResidualKernel(logisticKernel)
 			 && algorithmType == AlgorithmType::CCD
 			 && !usingGPU
 			 && !usingCUDA)
-			? LogisticKernelType::SPARSE_RESIDUAL
+			? logisticKernel
 			: LogisticKernelType::LEGACY;
-	if (effectiveLogisticKernel == LogisticKernelType::SPARSE_RESIDUAL) {
+	if (isSparseResidualKernel(effectiveLogisticKernel)) {
 		modelSpecifics.refreshSparseLogisticState(useCrossValidation);
+		if (!suppressSparseLogisticLambdaCounter) {
+			sparseLogisticPerformanceCounters.lambdaValues += 1;
+		}
+	}
+	if (effectiveLogisticKernel == LogisticKernelType::SPARSE_RESIDUAL_STRONG
+			|| effectiveLogisticKernel == LogisticKernelType::SPARSE_RESIDUAL_ACTIVE_STRONG) {
+		findModeSparseLogisticStrong(maxIterations, convergenceType, epsilon,
+				algorithmType, qnQ, doItAll,
+				effectiveLogisticKernel == LogisticKernelType::SPARSE_RESIDUAL_ACTIVE_STRONG);
+		updateCount += 1;
+		modelSpecifics.printTiming();
+		fisherInformationKnown = false;
+		varianceKnown = false;
+		return;
 	}
 
 	resetBounds();
@@ -1137,11 +1500,30 @@ void CyclicCoordinateDescent::findMode(
 		//modelSpecifics.resetBeta();
 	}
 
-// <<<<<<< HEAD
-	auto cycle = [this,&iteration,algorithmType,&allDelta,&doItAll,effectiveLogisticKernel] {
-// =======
-// 	auto cycle = [this,&lastObjFunc,&lastObjFuncVec,&iteration,algorithmType,&allDelta,&doItAll] {
-// >>>>>>> jni
+	const bool sparseLogisticActiveSetDiagnostic =
+			(effectiveLogisticKernel == LogisticKernelType::SPARSE_RESIDUAL_ACTIVE
+			 || (effectiveLogisticKernel == LogisticKernelType::SPARSE_RESIDUAL
+				 && std::getenv("CYCLOPS_SPARSE_LOGISTIC_ACTIVE_SET") != nullptr))
+			&& algorithmType == AlgorithmType::CCD
+			&& !usingGPU
+			&& !usingCUDA;
+	const char* sparseLogisticActiveSetMaxFractionEnv =
+			std::getenv("CYCLOPS_SPARSE_LOGISTIC_ACTIVE_SET_MAX_FRACTION");
+	const double sparseLogisticActiveSetMaxFraction =
+			sparseLogisticActiveSetMaxFractionEnv != nullptr
+			? std::atof(sparseLogisticActiveSetMaxFractionEnv)
+			: 0.50;
+	const char* sparseLogisticActiveSetMaxPassesEnv =
+			std::getenv("CYCLOPS_SPARSE_LOGISTIC_ACTIVE_SET_MAX_PASSES");
+	const int sparseLogisticActiveSetMaxPasses =
+			sparseLogisticActiveSetMaxPassesEnv != nullptr
+			? std::max(1, std::atoi(sparseLogisticActiveSetMaxPassesEnv))
+			: 100;
+
+	auto cycle = [this,&iteration,algorithmType,&allDelta,&doItAll,effectiveLogisticKernel](
+			const std::vector<int>* cycleIndices = nullptr) {
+		sparseLogisticEpochMaxCoordinateImpact = 0.0;
+		sparseLogisticEpochFittedChange = 0.0;
 /*
 		if (iteration%10==0) {
 			std::cout<<"iteration " << iteration << " ";
@@ -1203,42 +1585,59 @@ void CyclicCoordinateDescent::findMode(
 
 	    } else {
 
-	    	if (usingGPU) {
+		if (usingGPU) {
 			//if (usingGPU && syncCV) {
-	    		modelSpecifics.runCCD(useCrossValidation, doItAll);
-	    		if (!syncCV) {
-	    			hBeta = modelSpecifics.getBeta();
-	    		}
-	    	} else if (usingCUDA) {
-	    		for(int index = 0; index < J; index++) {
-	    			if (!fixBeta[index]) {
-	    				modelSpecifics.updateBetaAndDelta(index, useCrossValidation);
-	    			}
-	    		}
-	    		hBeta = modelSpecifics.getBeta();
-	    	} else {
+			modelSpecifics.runCCD(useCrossValidation, doItAll);
+			if (!syncCV) {
+				hBeta = modelSpecifics.getBeta();
+			}
+		} else if (usingCUDA) {
+			for(int index = 0; index < J; index++) {
+				if (!fixBeta[index]) {
+					modelSpecifics.updateBetaAndDelta(index, useCrossValidation);
+				}
+			}
+			hBeta = modelSpecifics.getBeta();
+		} else {
 
-	    		// Do a complete cycle in serial
-	    		for(int index = 0; index < J; index++) {
-
-	    			if (!fixBeta[index]) {
-						double delta = ccdUpdateBeta(index, effectiveLogisticKernel);
-						delta = applyBounds(delta, index);
-					//	std::cout << "index: " << index << " delta: " << delta << "\n";
-						if (delta != 0.0) {
-							sufficientStatisticsKnown = false;
-							updateSufficientStatistics(delta, index, effectiveLogisticKernel);
+			// Do a complete or active-set cycle in serial
+			const int cycleSize = cycleIndices == nullptr
+					? J
+					: static_cast<int>(cycleIndices->size());
+			for(int position = 0; position < cycleSize; position++) {
+				const int index = cycleIndices == nullptr ? position : (*cycleIndices)[position];
+				if (index >= 0 && index < J && !fixBeta[index]) {
+							double delta = ccdUpdateBeta(index, effectiveLogisticKernel);
+							delta = applyBounds(delta, index);
+							if (isSparseResidualKernel(effectiveLogisticKernel)
+									&& lastCoordinateHessian > 0.0) {
+								const double coordinateImpact = lastCoordinateHessian * delta * delta;
+								if (coordinateImpact > sparseLogisticEpochMaxCoordinateImpact) {
+									sparseLogisticEpochMaxCoordinateImpact = coordinateImpact;
+								}
+							}
+						//	std::cout << "index: " << index << " delta: " << delta << "\n";
+							if (delta != 0.0) {
+								sufficientStatisticsKnown = false;
+							sparseLogisticEpochFittedChange +=
+								updateSufficientStatistics(delta, index, effectiveLogisticKernel);
 						}
 				}
-	    			log(index);
-	    		}
-	    	}
+				log(index);
+			}
+		}
 	    }
-	    iteration++;
+		    iteration++;
+				if (isSparseResidualKernel(effectiveLogisticKernel)) {
+					sparseLogisticPerformanceCounters.ccdEpochs += 1;
+					if (countSparseLogisticActiveSetEpoch || cycleIndices != nullptr) {
+						sparseLogisticPerformanceCounters.activeSetOnlyEpochs += 1;
+				}
+			}
 	};
 
 	auto check = [this,&iteration,&lastObjFunc,algorithmType,&lastLogPosterior,&lastObjFuncVec,
-               convergenceType, epsilon,maxIterations] {
+               convergenceType, epsilon,maxIterations,effectiveLogisticKernel] {
                    bool done = false;
                    //		bool checkConvergence = (iteration % J == 0 || iteration == maxIterations);
                    bool checkConvergence = true; // Check after each complete cycle
@@ -1259,12 +1658,104 @@ void CyclicCoordinateDescent::findMode(
                        lastLogPosterior = thisLogPosterior;
                    }
 
-                   if (checkConvergence) {
-                	   if (syncCV) {
-                		   done = performCheckConvergence(convergenceType, epsilon, maxIterations, iteration, lastObjFuncVec);
-                	   } else {
-                		   done = performCheckConvergence(convergenceType, epsilon, maxIterations, iteration, &lastObjFunc);
-                	   }
+	                   if (checkConvergence) {
+		   auto sparseActiveKktGatePasses = [this, &iteration, maxIterations,
+			   epsilon, effectiveLogisticKernel](double movementCriterion) {
+			   if (!useSparseConvergenceActiveKktGate(sparseLogisticActiveKktTolerance)) {
+				   return true;
+			   }
+			   const double defaultMovementTolerance =
+					   sparseLogisticActiveKktMovementTolerance > 0.0
+					   ? sparseLogisticActiveKktMovementTolerance
+					   : epsilon;
+			   const double gateMovementTolerance = parsePositiveEnvDouble(
+					   "CYCLOPS_SPARSE_CONVERGENCE_ACTIVE_KKT_MOVEMENT_TOLERANCE",
+									   defaultMovementTolerance);
+			   if (movementCriterion > gateMovementTolerance) {
+				   return false;
+			   }
+			   const int checkEvery = parsePositiveEnvInt(
+					   "CYCLOPS_SPARSE_CONVERGENCE_ACTIVE_KKT_EVERY",
+									   std::max(1, sparseLogisticActiveKktCheckEvery));
+			   if (checkEvery > 1 && iteration < maxIterations && iteration % checkEvery != 0) {
+				   return false;
+			   }
+			   const double activeKktTolerance = parseEnvDouble(
+					   "CYCLOPS_SPARSE_CONVERGENCE_ACTIVE_KKT_TOLERANCE",
+									   sparseLogisticActiveKktTolerance >= 0.0
+									   ? sparseLogisticActiveKktTolerance
+									   : 0.0);
+			   double effectiveActiveKktTolerance = activeKktTolerance;
+			   const char* polishToleranceEnv = std::getenv(
+					   "CYCLOPS_SPARSE_CONVERGENCE_ACTIVE_KKT_POLISH_TOLERANCE");
+			   const double cvPolishTolerance = parsePositiveEnvDouble(
+					   "CYCLOPS_CV_POLISH_TOLERANCE", 0.0);
+			   const bool hasPolishActiveKktTolerance =
+					   (polishToleranceEnv != nullptr && polishToleranceEnv[0] != '\0')
+									   || sparseLogisticActiveKktPolishTolerance >= 0.0;
+			   if (hasPolishActiveKktTolerance
+					   && cvPolishTolerance > 0.0
+					   && epsilon <= cvPolishTolerance * (1.0 + 1e-12)) {
+				   effectiveActiveKktTolerance = parseEnvDouble(
+						   "CYCLOPS_SPARSE_CONVERGENCE_ACTIVE_KKT_POLISH_TOLERANCE",
+										   sparseLogisticActiveKktPolishTolerance >= 0.0
+										   ? sparseLogisticActiveKktPolishTolerance
+										   : activeKktTolerance);
+			   }
+		   sparseLogisticPerformanceCounters.strongRuleActiveKktChecks += 1;
+		   const double activeKktMaxViolation =
+				   computeSparseLogisticNonzeroKktMaxViolation(effectiveLogisticKernel);
+		   sparseLogisticPerformanceCounters.strongRuleActiveKktMaxViolation =
+				   std::max(sparseLogisticPerformanceCounters.strongRuleActiveKktMaxViolation,
+						   activeKktMaxViolation);
+		   if (activeKktMaxViolation > effectiveActiveKktTolerance) {
+			   sparseLogisticPerformanceCounters.strongRuleActiveKktFailures += 1;
+			   return false;
+		   }
+		   return true;
+	   };
+
+	   if (!syncCV
+				   && algorithmType == AlgorithmType::CCD
+				   && isSparseResidualKernel(effectiveLogisticKernel)
+				   && useSparseCoordinateImpactConvergence(sparseLogisticConvergenceType)) {
+		   const double scale = 1.0 + std::abs(getLogLikelihood());
+		   const double conv = sparseLogisticEpochMaxCoordinateImpact / scale;
+		   lastConvergenceCriterion = conv;
+		   if (epsilon > 0 && conv < epsilon) {
+			   if (sparseActiveKktGatePasses(conv)) {
+				   lastReturnFlag = SUCCESS;
+				   done = true;
+			   }
+		   } else if (iteration >= maxIterations) {
+			   lastReturnFlag = MAX_ITERATIONS;
+			   done = true;
+		   }
+		   return done;
+	   }
+	   if (!syncCV
+				   && algorithmType == AlgorithmType::CCD
+				   && isSparseResidualKernel(effectiveLogisticKernel)
+				   && useSparseFittedChangeConvergence(sparseLogisticConvergenceType)) {
+		   const double scale = 1.0 + std::abs(getLogLikelihood());
+		   const double conv = sparseLogisticEpochFittedChange / scale;
+		   lastConvergenceCriterion = conv;
+		   if (epsilon > 0 && conv < epsilon) {
+			   if (sparseActiveKktGatePasses(conv)) {
+				   lastReturnFlag = SUCCESS;
+				   done = true;
+			   }
+		   } else if (iteration >= maxIterations) {
+			   lastReturnFlag = MAX_ITERATIONS;
+			   done = true;
+		   }
+		   return done;
+	   }
+	   if (syncCV) {
+		   done = performCheckConvergence(convergenceType, epsilon, maxIterations, iteration, lastObjFuncVec);
+	   } else {
+		   done = performCheckConvergence(convergenceType, epsilon, maxIterations, iteration, &lastObjFunc);
+	   }
                    }
 
                    return done;
@@ -1272,6 +1763,7 @@ void CyclicCoordinateDescent::findMode(
 
 	qnQ = 0;
 
+	std::vector<int> activeIndices;
 	if (qnQ > 0) { // Use quasi-Newton
 	    // using namespace Eigen;
 	    //
@@ -1305,8 +1797,8 @@ void CyclicCoordinateDescent::findMode(
 	    //     }
 	    // }
 	    //
-	    // // 	    std::cerr << secantsU << std::endl << std::endl;
-	    // // 	    std::cerr << secantsV << std::endl;
+	    // //	    std::cerr << secantsU << std::endl << std::endl;
+	    // //	    std::cerr << secantsV << std::endl;
 	    //
 	    // int newestSecant = qnQ - 1;
 	    // int previousSecant = newestSecant - 1;
@@ -1316,11 +1808,11 @@ void CyclicCoordinateDescent::findMode(
 	    //     // 2 cycles for each QN step
 	    //     x = Map<const VectorXd>(hBeta.data(), J); // Make copy
 	    //     cycle();
-	    //     // 	        done = check();
-	    //     // 	        if (done) {
-	    //     // 	            std::cerr << "break A" << std::endl;
-	    //     // 	            break;
-	    //     // 	        }
+	    //     //	        done = check();
+	    //     //	        if (done) {
+	    //     //	            std::cerr << "break A" << std::endl;
+	    //     //	            break;
+	    //     //	        }
 	    //
 	    //     secantsU.col(newestSecant) = Map<const VectorXd>(hBeta.data(), J) - x;
 	    //
@@ -1328,11 +1820,11 @@ void CyclicCoordinateDescent::findMode(
 	    //
 	    //     x = Map<const VectorXd>(hBeta.data(), J);
 	    //     cycle();
-	    //     // 	        done = check();
-	    //     // 	        if (done) {
-	    //     // 	            std::cerr << "break B" << std::endl;
-	    //     // 	            break;
-	    //     // 	        }
+	    //     //	        done = check();
+	    //     //	        if (done) {
+	    //     //	            std::cerr << "break B" << std::endl;
+	    //     //	            break;
+	    //     //	        }
 	    //
 	    //     secantsV.col(newestSecant) = Map<const VectorXd>(hBeta.data(), J) - x;
 	    //
@@ -1415,12 +1907,162 @@ void CyclicCoordinateDescent::findMode(
 	    //     previousSecant = newestSecant;
 	    //     newestSecant = (newestSecant + 1) % qnQ;
 	    // }
-    } else { // No QN
-        while (!done) {
-            cycle();
-            done = check();
+	} else { // No QN
+		if (sparseLogisticActiveSetDiagnostic) {
+			activeIndices.reserve(J);
+		}
+	    while (!done) {
+	        cycle(nullptr);
+	        done = check();
+            if (done || !sparseLogisticActiveSetDiagnostic) {
+	continue;
+            }
+
+	            for (int activePass = 0; activePass < sparseLogisticActiveSetMaxPasses; ++activePass) {
+		activeIndices.clear();
+		for (int j = 0; j < J; ++j) {
+			if (fixBeta[j]) {
+				continue;
+		}
+		if (hBeta[j] != 0.0 || !jointPrior->getSupportsKktSwindle(j)) {
+			activeIndices.push_back(j);
+		}
+	}
+		if (activeIndices.empty()
+				|| activeIndices.size() >= static_cast<size_t>(J)
+				|| static_cast<double>(activeIndices.size())
+					> sparseLogisticActiveSetMaxFraction * static_cast<double>(J)) {
+			break;
+		}
+		sparseLogisticPerformanceCounters.activeSetSizeTotal += activeIndices.size();
+		sparseLogisticPerformanceCounters.setSizeRecords += 1;
+
+	cycle(&activeIndices);
+	const bool activeDone = check();
+	if (activeDone) {
+		sparseLogisticPerformanceCounters.activeSetFullReconciliationSweeps += 1;
+		cycle(nullptr);
+		done = check();
+		break;
+	}
+            }
         }
     }
+
+	if (lastReturnFlag == SUCCESS
+			&& effectiveLogisticKernel == LogisticKernelType::SPARSE_RESIDUAL_ACTIVE
+			&& useSparseActiveKktRepair()) {
+		const int maxRepairs = parsePositiveEnvInt(
+				"CYCLOPS_SPARSE_ACTIVE_KKT_MAX_REPAIRS", 3);
+		const double maxFraction = parsePositiveEnvDouble(
+				"CYCLOPS_SPARSE_ACTIVE_KKT_MAX_FRACTION", 0.50);
+		const double repairEpsilon = parsePositiveEnvDouble(
+				"CYCLOPS_SPARSE_ACTIVE_KKT_SOLVE_EPSILON", std::min(epsilon, 1e-8));
+		const double absoluteTolerance = parsePositiveEnvDouble(
+				"CYCLOPS_SPARSE_ACTIVE_KKT_TOLERANCE", 0.0);
+
+		std::vector<double> boundaries(J, 0.0);
+		for (int j = 0; j < J; ++j) {
+			if (!fixBeta[j] && jointPrior->getSupportsKktSwindle(j)) {
+				boundaries[j] = jointPrior->getKktBoundary(j);
+			}
+		}
+
+		std::vector<bool> active(J, false);
+		activeIndices.clear();
+		for (int j = 0; j < J; ++j) {
+			if (fixBeta[j]) {
+				continue;
+			}
+			if (hBeta[j] != 0.0 || !jointPrior->getSupportsKktSwindle(j)) {
+				active[j] = true;
+				activeIndices.push_back(j);
+			}
+		}
+
+		for (int repair = 0; repair <= maxRepairs; ++repair) {
+			std::vector<int> violators;
+			size_t scannedNnz = 0;
+			const auto kktStart = std::chrono::steady_clock::now();
+			for (int j = 0; j < J; ++j) {
+				if (fixBeta[j] || active[j] || !jointPrior->getSupportsKktSwindle(j)) {
+					continue;
+				}
+				scannedNnz += modelSpecifics.getSparseLogisticColumnScanSize(j, useCrossValidation);
+				const double gradient = computeGradientForKernel(j, LogisticKernelType::SPARSE_RESIDUAL);
+				const double boundary = boundaries[j];
+				const double violation = std::abs(gradient) - boundary;
+				const double threshold = std::max(absoluteTolerance, boundary * 1e-10 + 1e-12);
+				if (violation > threshold) {
+					violators.push_back(j);
+				}
+			}
+			const auto kktEnd = std::chrono::steady_clock::now();
+			modelSpecifics.addSparseLogisticKktScan(scannedNnz,
+					std::chrono::duration<double>(kktEnd - kktStart).count());
+
+			if (violators.empty()) {
+				sparseLogisticPerformanceCounters.strongRuleActiveKktChecks += 1;
+				const double activeKktMaxViolation = computeStrongActiveKktMaxViolation(
+						activeIndices, boundaries, LogisticKernelType::SPARSE_RESIDUAL);
+				sparseLogisticPerformanceCounters.strongRuleActiveKktMaxViolation =
+					std::max(sparseLogisticPerformanceCounters.strongRuleActiveKktMaxViolation,
+							activeKktMaxViolation);
+				if (activeKktMaxViolation > absoluteTolerance) {
+					sparseLogisticPerformanceCounters.strongRuleActiveKktFailures += 1;
+					if (repair < maxRepairs) {
+						findModeRestricted(activeIndices, maxIterations, convergenceType, repairEpsilon,
+								algorithmType, qnQ, doItAll, LogisticKernelType::SPARSE_RESIDUAL);
+						if (lastReturnFlag != SUCCESS) {
+							break;
+						}
+						continue;
+					}
+					const bool oldSuppress = suppressSparseLogisticLambdaCounter;
+					suppressSparseLogisticLambdaCounter = true;
+					findMode(maxIterations, convergenceType, repairEpsilon,
+							algorithmType, qnQ, doItAll, LogisticKernelType::SPARSE_RESIDUAL);
+					suppressSparseLogisticLambdaCounter = oldSuppress;
+				}
+				break;
+			}
+			if (repair == maxRepairs) {
+				const bool oldSuppress = suppressSparseLogisticLambdaCounter;
+				suppressSparseLogisticLambdaCounter = true;
+				findMode(maxIterations, convergenceType, repairEpsilon,
+						algorithmType, qnQ, doItAll, LogisticKernelType::SPARSE_RESIDUAL);
+				suppressSparseLogisticLambdaCounter = oldSuppress;
+				break;
+			}
+			for (const int j : violators) {
+				if (!active[j]) {
+					active[j] = true;
+					activeIndices.push_back(j);
+				}
+			}
+			sparseLogisticPerformanceCounters.strongRuleViolations += violators.size();
+			sparseLogisticPerformanceCounters.activeSetSizeTotal += activeIndices.size();
+			sparseLogisticPerformanceCounters.setSizeRecords += 1;
+
+			if (activeIndices.size() >= static_cast<size_t>(J)
+					|| static_cast<double>(activeIndices.size())
+						> maxFraction * static_cast<double>(J)) {
+				const bool oldSuppress = suppressSparseLogisticLambdaCounter;
+				suppressSparseLogisticLambdaCounter = true;
+				findMode(maxIterations, convergenceType, repairEpsilon,
+						algorithmType, qnQ, doItAll, LogisticKernelType::SPARSE_RESIDUAL);
+				suppressSparseLogisticLambdaCounter = oldSuppress;
+				break;
+			}
+			findModeRestricted(activeIndices, maxIterations, convergenceType, repairEpsilon,
+					algorithmType, qnQ, doItAll, LogisticKernelType::SPARSE_RESIDUAL);
+			if (lastReturnFlag != SUCCESS) {
+				break;
+			}
+		}
+	}
+
+	maybeComputeSparseLogisticGapSafeDiagnostic(effectiveLogisticKernel);
 
 	lastIterationCount = iteration;
 //	std::cout << "iterations: " << lastIterationCount << " lastObjFunc: " << lastObjFunc << '\n';
@@ -1431,6 +2073,408 @@ void CyclicCoordinateDescent::findMode(
 
 	fisherInformationKnown = false;
 	varianceKnown = false;
+}
+
+void CyclicCoordinateDescent::resetSparseLogisticPerformanceCounters() {
+	sparseLogisticPerformanceCounters = SparseLogisticPerformanceCounters();
+	modelSpecifics.resetSparseLogisticPerformanceCounters();
+}
+
+SparseLogisticPerformanceCounters CyclicCoordinateDescent::getSparseLogisticPerformanceCounters() const {
+	auto counters = sparseLogisticPerformanceCounters;
+	counters.add(modelSpecifics.getSparseLogisticPerformanceCounters());
+	return counters;
+}
+
+void CyclicCoordinateDescent::addSparseLogisticPerformanceCounters(
+		const SparseLogisticPerformanceCounters& counters) {
+	sparseLogisticPerformanceCounters.add(counters);
+}
+
+double CyclicCoordinateDescent::computeSparseLogisticFullKktMaxViolation(
+		const LogisticKernelType logisticKernel) {
+	std::vector<double> boundaries(J, 0.0);
+	std::vector<int> allIndices;
+	allIndices.reserve(J);
+	for (int j = 0; j < J; ++j) {
+		if (fixBeta[j] || !jointPrior->getSupportsKktSwindle(j)) {
+			continue;
+		}
+		boundaries[j] = jointPrior->getKktBoundary(j);
+		allIndices.push_back(j);
+	}
+	return computeStrongActiveKktMaxViolation(allIndices, boundaries, logisticKernel);
+}
+
+double CyclicCoordinateDescent::computeSparseLogisticNonzeroKktMaxViolation(
+		const LogisticKernelType logisticKernel) {
+	std::vector<double> boundaries(J, 0.0);
+	std::vector<int> activeIndices;
+	activeIndices.reserve(J);
+	for (int j = 0; j < J; ++j) {
+		if (fixBeta[j]) {
+			continue;
+		}
+		if (hBeta[j] != 0.0 || !jointPrior->getSupportsKktSwindle(j)) {
+			boundaries[j] = jointPrior->getKktBoundary(j);
+			activeIndices.push_back(j);
+		}
+	}
+	return computeStrongActiveKktMaxViolation(activeIndices, boundaries, logisticKernel);
+}
+
+void CyclicCoordinateDescent::maybeComputeSparseLogisticGapSafeDiagnostic(
+		const LogisticKernelType logisticKernel) {
+	if (std::getenv("CYCLOPS_GAP_SAFE_DIAGNOSTIC") == nullptr
+			|| suppressSparseLogisticLambdaCounter
+			|| lastReturnFlag != SUCCESS
+			|| !isSparseResidualKernel(logisticKernel)) {
+		return;
+	}
+	std::vector<double> boundaries(J, 0.0);
+	double penalty = 0.0;
+	for (int j = 0; j < J; ++j) {
+		if (fixBeta[j]) {
+			continue;
+		}
+		if (jointPrior->getSupportsKktSwindle(j)) {
+			boundaries[j] = jointPrior->getKktBoundary(j);
+			penalty += boundaries[j] * std::abs(hBeta[j]);
+		}
+	}
+	const auto diagnostic = modelSpecifics.computeSparseLogisticGapSafeDiagnostic(
+			boundaries, fixBeta, hBeta, penalty, useCrossValidation);
+	if (!diagnostic.available) {
+		return;
+	}
+	SparseLogisticPerformanceCounters counters;
+	counters.gapSafeChecks = 1;
+	counters.gapSafeDualFeasibleChecks = diagnostic.dualFeasible ? 1 : 0;
+	counters.gapSafeScreenedColumns = diagnostic.screenedColumns;
+	counters.gapSafeScreenedNnz = diagnostic.screenedNnz;
+	counters.gapSafeEligibleColumns = diagnostic.eligibleColumns;
+	counters.gapSafeEligibleNnz = diagnostic.eligibleNnz;
+	counters.gapSafeTotalColumns = diagnostic.totalColumns;
+	counters.gapSafeTotalNnz = diagnostic.totalNnz;
+	counters.gapSafeSeconds = diagnostic.seconds;
+	counters.gapSafeMaxScreenedColumns = static_cast<double>(diagnostic.screenedColumns);
+	counters.gapSafeMaxScreenedNnz = static_cast<double>(diagnostic.screenedNnz);
+	counters.gapSafeLastPrimalObjective = diagnostic.primalObjective;
+	counters.gapSafeLastDualObjective = diagnostic.dualObjective;
+	counters.gapSafeLastGap = diagnostic.dualityGap;
+	counters.gapSafeLastRadius = diagnostic.safeRadius;
+	counters.gapSafeLastDualScale = diagnostic.dualScale;
+	counters.gapSafeMaxUnpenalizedGradient = diagnostic.maxUnpenalizedGradient;
+	addSparseLogisticPerformanceCounters(counters);
+}
+
+CyclicCoordinateDescent::StrongRuleHistory& CyclicCoordinateDescent::getCurrentStrongRuleHistory() {
+	const size_t slot = static_cast<size_t>(currentStrongRuleSlot + 1);
+	if (strongRuleHistories.size() <= slot) {
+		strongRuleHistories.resize(slot + 1);
+	}
+	return strongRuleHistories[slot];
+}
+
+void CyclicCoordinateDescent::invalidateCurrentStrongRuleState() {
+	auto& history = getCurrentStrongRuleHistory();
+	for (auto& reference : history.references) {
+		reference.valid = false;
+	}
+}
+
+const CyclicCoordinateDescent::StrongRuleState*
+CyclicCoordinateDescent::selectStrongRuleReference(double currentLambda) const {
+	const size_t slot = static_cast<size_t>(currentStrongRuleSlot + 1);
+	if (strongRuleHistories.size() <= slot) {
+		return nullptr;
+	}
+	const StrongRuleState* best = nullptr;
+	double bestScore = 0.0;
+	for (const auto& reference : strongRuleHistories[slot].references) {
+		if (!reference.valid
+				|| reference.gradients.size() != static_cast<size_t>(J)
+				|| reference.boundaries.size() != static_cast<size_t>(J)
+				|| reference.beta.size() != static_cast<size_t>(J)
+				|| reference.lambda <= 0.0) {
+			continue;
+		}
+		const double score = currentLambda - std::abs(currentLambda - reference.lambda);
+		if (score > bestScore) {
+			bestScore = score;
+			best = &reference;
+		}
+	}
+	return best;
+}
+
+void CyclicCoordinateDescent::storeStrongRuleState(
+		StrongRuleHistory& history, double variance, double lambda) {
+	const auto start = std::chrono::steady_clock::now();
+	StrongRuleState state;
+	state.variance = variance;
+	state.lambda = lambda;
+	state.gradients.resize(J);
+	state.boundaries.resize(J);
+	state.beta = hBeta;
+	for (int j = 0; j < J; ++j) {
+		if (fixBeta[j]) {
+			state.gradients[j] = 0.0;
+			state.boundaries[j] = 0.0;
+		} else {
+			state.gradients[j] = computeGradientForKernel(j, LogisticKernelType::SPARSE_RESIDUAL);
+			state.boundaries[j] = jointPrior->getKktBoundary(j);
+		}
+	}
+	state.valid = true;
+	history.references.push_back(std::move(state));
+	constexpr size_t maxStrongRuleReferences = 16;
+	if (history.references.size() > maxStrongRuleReferences) {
+		history.references.erase(history.references.begin());
+	}
+	const auto end = std::chrono::steady_clock::now();
+	SparseLogisticPerformanceCounters counters;
+	counters.screeningSeconds = std::chrono::duration<double>(end - start).count();
+	addSparseLogisticPerformanceCounters(counters);
+}
+
+void CyclicCoordinateDescent::findModeRestricted(
+		const std::vector<int>& activeIndices,
+		const int maxIterations, const int convergenceType, const double epsilon,
+		const AlgorithmType algorithmType, const int qnQ, const bool doItAll,
+		const LogisticKernelType logisticKernel) {
+	const auto savedFixBeta = fixBeta;
+	std::fill(fixBeta.begin(), fixBeta.end(), true);
+	for (const auto index : activeIndices) {
+		if (index >= 0 && index < J && !savedFixBeta[index]) {
+			fixBeta[index] = false;
+		}
+	}
+	const bool oldSuppress = suppressSparseLogisticLambdaCounter;
+	const bool oldActiveEpoch = countSparseLogisticActiveSetEpoch;
+	suppressSparseLogisticLambdaCounter = true;
+	countSparseLogisticActiveSetEpoch = activeIndices.size() < static_cast<size_t>(J);
+	findMode(maxIterations, convergenceType, epsilon, algorithmType, qnQ, doItAll, logisticKernel);
+	suppressSparseLogisticLambdaCounter = oldSuppress;
+	countSparseLogisticActiveSetEpoch = oldActiveEpoch;
+	fixBeta = savedFixBeta;
+}
+
+void CyclicCoordinateDescent::findModeSparseLogisticStrong(
+		const int maxIterations, const int convergenceType, const double epsilon,
+		const AlgorithmType algorithmType, const int qnQ, const bool doItAll,
+		const bool useActiveInnerSolver) {
+	const LogisticKernelType strongSolveKernel = useActiveInnerSolver
+		? LogisticKernelType::SPARSE_RESIDUAL_ACTIVE
+		: LogisticKernelType::SPARSE_RESIDUAL;
+	const LogisticKernelType strongDiagnosticKernel = useActiveInnerSolver
+		? LogisticKernelType::SPARSE_RESIDUAL_ACTIVE_STRONG
+		: LogisticKernelType::SPARSE_RESIDUAL_STRONG;
+	auto& history = getCurrentStrongRuleHistory();
+	const auto varianceList = jointPrior->getVariance();
+	const double currentVariance = varianceList.empty() ? 0.0 : varianceList[0];
+	const double currentLambda = currentVariance > 0.0
+		? convertVarianceToHyperparameter(currentVariance)
+		: 0.0;
+	std::vector<double> currentBoundaries(J, 0.0);
+	for (int j = 0; j < J; ++j) {
+		currentBoundaries[j] = jointPrior->getKktBoundary(j);
+	}
+
+	const auto setupStart = std::chrono::steady_clock::now();
+	const StrongRuleState* reference = selectStrongRuleReference(currentLambda);
+	const bool useStrongRule = reference != nullptr;
+	const char* activeKktToleranceEnv = std::getenv("CYCLOPS_STRONG_ACTIVE_KKT_TOLERANCE");
+	const bool useActiveKktGuard = activeKktToleranceEnv != nullptr;
+	const double activeKktTolerance = useActiveKktGuard
+		? std::atof(activeKktToleranceEnv)
+		: 0.0;
+	const char* activeKktSolveEpsilonEnv = std::getenv("CYCLOPS_STRONG_ACTIVE_KKT_SOLVE_EPSILON");
+	const double activeKktSolveEpsilon = activeKktSolveEpsilonEnv != nullptr
+		? std::atof(activeKktSolveEpsilonEnv)
+		: std::min(epsilon, 1e-8);
+	const char* activeKktMaxRepairsEnv = std::getenv("CYCLOPS_STRONG_ACTIVE_KKT_MAX_REPAIRS");
+	const int activeKktMaxRepairs = activeKktMaxRepairsEnv != nullptr
+		? std::max(0, std::atoi(activeKktMaxRepairsEnv))
+		: 3;
+	const char* strongCvFinalEpsilonEnv = std::getenv("CYCLOPS_STRONG_CV_FINAL_EPSILON");
+	const double parsedStrongCvFinalEpsilon = strongCvFinalEpsilonEnv != nullptr
+		? std::atof(strongCvFinalEpsilonEnv)
+		: 0.0;
+	const bool useStrongCvFinalEpsilon = useCrossValidation
+		&& parsedStrongCvFinalEpsilon > 0.0
+		&& parsedStrongCvFinalEpsilon < epsilon;
+	const double strongCvFinalEpsilon = useStrongCvFinalEpsilon
+		? parsedStrongCvFinalEpsilon
+		: epsilon;
+	if (useStrongRule) {
+		sparseLogisticPerformanceCounters.strongRuleReferenceUses += 1;
+	} else {
+		sparseLogisticPerformanceCounters.strongRuleNoReference += 1;
+	}
+
+	std::vector<bool> active(J, false);
+	std::vector<int> activeIndices;
+	activeIndices.reserve(J);
+	size_t screenedColumns = 0;
+	size_t screenedNnz = 0;
+	for (int j = 0; j < J; ++j) {
+		if (fixBeta[j]) {
+			continue;
+		}
+		bool include = false;
+		if (!jointPrior->getSupportsKktSwindle(j) || currentBoundaries[j] <= 0.0) {
+			include = true;
+		} else if (hBeta[j] != 0.0) {
+			include = true;
+			sparseLogisticPerformanceCounters.strongRuleKeptCurrentNonzero += 1;
+		} else if (useStrongRule && (*reference).beta[j] != 0.0) {
+			include = true;
+			sparseLogisticPerformanceCounters.strongRuleKeptReferenceNonzero += 1;
+		} else if (!useStrongRule) {
+			include = true;
+		} else {
+			const double threshold = currentBoundaries[j]
+				- std::abs(currentBoundaries[j] - (*reference).boundaries[j]);
+			if (threshold <= 1e-12) {
+				include = true;
+				sparseLogisticPerformanceCounters.strongRuleKeptThresholdNonPositive += 1;
+			} else if (std::abs((*reference).gradients[j]) >= threshold - 1e-12) {
+				include = true;
+				sparseLogisticPerformanceCounters.strongRuleKeptGradient += 1;
+			}
+		}
+		if (include) {
+			active[j] = true;
+			activeIndices.push_back(j);
+		} else {
+			screenedColumns += 1;
+			screenedNnz += modelSpecifics.getSparseLogisticColumnScanSize(j, useCrossValidation);
+		}
+	}
+	sparseLogisticPerformanceCounters.strongRuleScreenedColumns += screenedColumns;
+	sparseLogisticPerformanceCounters.strongRuleScreenedNnz += screenedNnz;
+	const auto setupEnd = std::chrono::steady_clock::now();
+	sparseLogisticPerformanceCounters.setupSeconds +=
+		std::chrono::duration<double>(setupEnd - setupStart).count();
+	sparseLogisticPerformanceCounters.strongSetSizeTotal += activeIndices.size();
+	sparseLogisticPerformanceCounters.activeSetSizeTotal += activeIndices.size();
+	sparseLogisticPerformanceCounters.setSizeRecords += 1;
+
+	if (activeIndices.size() == static_cast<size_t>(J)) {
+		sparseLogisticPerformanceCounters.strongRuleFullSetBypasses += 1;
+		const bool oldSuppress = suppressSparseLogisticLambdaCounter;
+		suppressSparseLogisticLambdaCounter = true;
+		findMode(maxIterations, convergenceType, strongCvFinalEpsilon, algorithmType, qnQ, doItAll,
+				strongSolveKernel);
+		suppressSparseLogisticLambdaCounter = oldSuppress;
+		if (lastReturnFlag == SUCCESS) {
+			storeStrongRuleState(history, currentVariance, currentLambda);
+			maybeComputeSparseLogisticGapSafeDiagnostic(strongDiagnosticKernel);
+		} else {
+			for (auto& stored : history.references) {
+				stored.valid = false;
+			}
+		}
+		return;
+	}
+
+	bool repaired = false;
+	int activeKktRepairs = 0;
+	while (true) {
+		const double restrictedEpsilon = activeKktRepairs > 0
+			? std::min(activeKktSolveEpsilon, strongCvFinalEpsilon)
+			: strongCvFinalEpsilon;
+		findModeRestricted(activeIndices, maxIterations, convergenceType, restrictedEpsilon,
+				algorithmType, qnQ, doItAll, strongSolveKernel);
+		if (lastReturnFlag != SUCCESS) {
+			for (auto& stored : history.references) {
+				stored.valid = false;
+			}
+			return;
+		}
+
+		std::vector<int> violators;
+		size_t scannedNnz = 0;
+		const auto kktStart = std::chrono::steady_clock::now();
+		for (int j = 0; j < J; ++j) {
+			if (fixBeta[j] || active[j] || !jointPrior->getSupportsKktSwindle(j)) {
+				continue;
+			}
+			scannedNnz += modelSpecifics.getSparseLogisticColumnScanSize(j, useCrossValidation);
+			const double gradient = computeGradientForKernel(j, LogisticKernelType::SPARSE_RESIDUAL);
+			const double boundary = currentBoundaries[j];
+			const double violation = std::abs(gradient) - boundary;
+			if (violation > boundary * 1e-10 + 1e-12) {
+				violators.push_back(j);
+			}
+		}
+		const auto kktEnd = std::chrono::steady_clock::now();
+		modelSpecifics.addSparseLogisticKktScan(scannedNnz,
+				std::chrono::duration<double>(kktEnd - kktStart).count());
+
+		if (violators.empty()) {
+			if (useActiveKktGuard) {
+				sparseLogisticPerformanceCounters.strongRuleActiveKktChecks += 1;
+				const double activeKktMaxViolation = computeStrongActiveKktMaxViolation(
+						activeIndices, currentBoundaries, LogisticKernelType::SPARSE_RESIDUAL);
+				sparseLogisticPerformanceCounters.strongRuleActiveKktMaxViolation =
+					std::max(sparseLogisticPerformanceCounters.strongRuleActiveKktMaxViolation,
+							activeKktMaxViolation);
+				if (activeKktMaxViolation > activeKktTolerance) {
+					sparseLogisticPerformanceCounters.strongRuleActiveKktFailures += 1;
+					if (activeKktRepairs < activeKktMaxRepairs) {
+						activeKktRepairs += 1;
+						continue;
+					}
+					const bool oldSuppress = suppressSparseLogisticLambdaCounter;
+					suppressSparseLogisticLambdaCounter = true;
+					findMode(maxIterations, convergenceType,
+							std::min(activeKktSolveEpsilon, strongCvFinalEpsilon),
+							algorithmType, qnQ, doItAll, strongSolveKernel);
+					suppressSparseLogisticLambdaCounter = oldSuppress;
+					if (lastReturnFlag != SUCCESS) {
+						for (auto& stored : history.references) {
+							stored.valid = false;
+						}
+						return;
+					}
+				}
+			}
+			break;
+		}
+		repaired = true;
+		sparseLogisticPerformanceCounters.strongRuleViolations += violators.size();
+		for (const auto j : violators) {
+			if (!active[j]) {
+				active[j] = true;
+				activeIndices.push_back(j);
+			}
+		}
+		sparseLogisticPerformanceCounters.activeSetSizeTotal += activeIndices.size();
+		sparseLogisticPerformanceCounters.setSizeRecords += 1;
+		if (repaired && static_cast<int>(activeIndices.size()) == J) {
+			continue;
+		}
+	}
+
+	if (std::getenv("CYCLOPS_STRONG_FINAL_FULL_POLISH")) {
+		const bool oldSuppress = suppressSparseLogisticLambdaCounter;
+		suppressSparseLogisticLambdaCounter = true;
+		findMode(maxIterations, convergenceType, strongCvFinalEpsilon, algorithmType, qnQ, doItAll,
+				strongSolveKernel);
+		suppressSparseLogisticLambdaCounter = oldSuppress;
+		if (lastReturnFlag != SUCCESS) {
+			for (auto& stored : history.references) {
+				stored.valid = false;
+			}
+			return;
+		}
+	}
+
+	storeStrongRuleState(history, currentVariance, currentLambda);
+	lastReturnFlag = SUCCESS;
+	maybeComputeSparseLogisticGapSafeDiagnostic(strongDiagnosticKernel);
 }
 
 /**
@@ -1452,13 +2496,13 @@ double CyclicCoordinateDescent::getLogPriorGradient(int index) {
 
 double CyclicCoordinateDescent::getLogLikelihoodGradient(int index) {
 
- 	checkAllLazyFlags();
+	checkAllLazyFlags();
 
- 	double gradient, hessian;
- 	computeNumeratorForGradient(index);
- 	modelSpecifics.computeGradientAndHessian(index, &gradient, &hessian, useCrossValidation);
+	double gradient, hessian;
+	computeNumeratorForGradient(index);
+	modelSpecifics.computeGradientAndHessian(index, &gradient, &hessian, useCrossValidation);
 
- 	return -gradient;
+	return -gradient;
  }
 
 void CyclicCoordinateDescent::computeGradientAndHessian(int index, double *ogradient,
@@ -1468,9 +2512,9 @@ void CyclicCoordinateDescent::computeGradientAndHessian(int index, double *ograd
 
 void CyclicCoordinateDescent::computeGradientAndHessianForKernel(
 		int index,
-		priors::GradientHessian& gh,
-		const LogisticKernelType logisticKernel) {
-	if (logisticKernel == LogisticKernelType::SPARSE_RESIDUAL) {
+	priors::GradientHessian& gh,
+	const LogisticKernelType logisticKernel) {
+	if (isSparseResidualKernel(logisticKernel)) {
 		modelSpecifics.computeSparseLogisticGradientAndHessian(
 				index, &gh.first, &gh.second, useCrossValidation);
 	} else {
@@ -1478,6 +2522,51 @@ void CyclicCoordinateDescent::computeGradientAndHessianForKernel(
 		computeNumeratorForGradient(index);
 		computeGradientAndHessian(index, &gh.first, &gh.second);
 	}
+}
+
+double CyclicCoordinateDescent::computeGradientForKernel(
+		int index,
+		const LogisticKernelType logisticKernel) {
+	double gradient;
+	if (isSparseResidualKernel(logisticKernel)) {
+		modelSpecifics.computeSparseLogisticGradientAndHessian(
+				index, &gradient, nullptr, useCrossValidation);
+	} else {
+		priors::GradientHessian gh;
+		computeNumeratorForGradient(index);
+		computeGradientAndHessian(index, &gh.first, &gh.second);
+		gradient = gh.first;
+	}
+	return gradient;
+}
+
+double CyclicCoordinateDescent::computeStrongActiveKktMaxViolation(
+		const std::vector<int>& activeIndices,
+		const std::vector<double>& boundaries,
+		const LogisticKernelType logisticKernel) {
+	double maxViolation = 0.0;
+	size_t scannedNnz = 0;
+	const auto kktStart = std::chrono::steady_clock::now();
+	for (const int j : activeIndices) {
+		if (j < 0 || j >= J || fixBeta[j] || !jointPrior->getSupportsKktSwindle(j)) {
+			continue;
+		}
+		scannedNnz += modelSpecifics.getSparseLogisticColumnScanSize(j, useCrossValidation);
+		const double gradient = computeGradientForKernel(j, logisticKernel);
+		const double boundary = boundaries[j];
+		const double beta = hBeta[j];
+		double violation = 0.0;
+		if (beta == 0.0) {
+			violation = std::max(0.0, std::abs(gradient) - boundary);
+		} else {
+			violation = std::abs(gradient + boundary * (beta > 0.0 ? 1.0 : -1.0));
+		}
+		maxViolation = std::max(maxViolation, violation);
+	}
+	const auto kktEnd = std::chrono::steady_clock::now();
+	modelSpecifics.addSparseLogisticKktScan(scannedNnz,
+			std::chrono::duration<double>(kktEnd - kktStart).count());
+	return maxViolation;
 }
 
 void CyclicCoordinateDescent::computeNumeratorForGradient(int index) {
@@ -1537,20 +2626,20 @@ double CyclicCoordinateDescent::getAsymptoticVariance(int indexOne, int indexTwo
 }
 
 // double CyclicCoordinateDescent::getAsymptoticPrecision(int indexOne, int indexTwo) {
-// 	checkAllLazyFlags();
-// 	if (!fisherInformationKnown) {
-// 		computeAsymptoticPrecisionMatrix();
-// 		fisherInformationKnown = true;
-// 	}
+//	checkAllLazyFlags();
+//	if (!fisherInformationKnown) {
+//		computeAsymptoticPrecisionMatrix();
+//		fisherInformationKnown = true;
+//	}
 //
-// 	IndexMap::iterator itOne = hessianIndexMap.find(indexOne);
-// 	IndexMap::iterator itTwo = hessianIndexMap.find(indexTwo);
+//	IndexMap::iterator itOne = hessianIndexMap.find(indexOne);
+//	IndexMap::iterator itTwo = hessianIndexMap.find(indexTwo);
 //
-// 	if (itOne == hessianIndexMap.end() || itTwo == hessianIndexMap.end()) {
-// 		return NAN;
-// 	} else {
-// 		return hessianMatrix(itOne->second, itTwo->second);
-// 	}
+//	if (itOne == hessianIndexMap.end() || itTwo == hessianIndexMap.end()) {
+//		return NAN;
+//	} else {
+//		return hessianMatrix(itOne->second, itTwo->second);
+//	}
 // }
 
 CyclicCoordinateDescent::Matrix CyclicCoordinateDescent::computeFisherInformation(const std::vector<IdType>& indices) const {
@@ -1616,7 +2705,7 @@ void CyclicCoordinateDescent::computeAsymptoticPrecisionMatrix(void) {
 
 void CyclicCoordinateDescent::computeAsymptoticVarianceMatrix(void) {
 	varianceMatrix = hessianMatrix.inverse();
-// 	cout << varianceMatrix << endl;
+//	cout << varianceMatrix << endl;
 }
 
 void CyclicCoordinateDescent::mmUpdateAllBeta(std::vector<double>& delta,
@@ -1673,12 +2762,14 @@ double CyclicCoordinateDescent::ccdUpdateBeta(int index, const LogisticKernelTyp
 
 	priors::GradientHessian gh;
 	computeGradientAndHessianForKernel(index, gh, logisticKernel);
+	lastCoordinateHessian = gh.second;
 
 //	std::cout << "index: " << index << " grad: " << gh.first << " hess: " << gh.second << "\n";
 
 	if (gh.second < 0.0) {
 	    gh.first = 0.0;
 	    gh.second = 0.0;
+	    lastCoordinateHessian = 0.0;
 	}
 
 	return jointPrior->getDelta(gh, hBeta, index, *this);
@@ -1690,35 +2781,35 @@ void CyclicCoordinateDescent::axpyXBeta(const double beta, const int j) {
 
 // template <class IteratorType>
 // void CyclicCoordinateDescent::axpy(double* y, const double alpha, const int index) {
-// 	IteratorType it(hXI, index);
-// 	for (; it; ++it) {
-// 		const int k = it.index();
-// 		y[k] += alpha * it.value();
-// 	}
+//	IteratorType it(hXI, index);
+//	for (; it; ++it) {
+//		const int k = it.index();
+//		y[k] += alpha * it.value();
+//	}
 // }
 //
 // void CyclicCoordinateDescent::axpyXBeta(const double beta, const int j) {
-// 	if (beta != static_cast<double>(0.0)) {
-// 		switch (hXI.getFormatType(j)) {
-// 		case INDICATOR:
-// 			axpy < IndicatorIterator > (hXBeta.data(), beta, j);
-// 			break;
-// 		case INTERCEPT:
-// 		    axpy < InterceptIterator > (hXBeta.data(), beta, j);
-// 		    break;
-// 		case DENSE:
-// 			axpy < DenseIterator > (hXBeta.data(), beta, j);
-// 			break;
-// 		case SPARSE:
-// 			axpy < SparseIterator > (hXBeta.data(), beta, j);
-// 			break;
-// 		default:
-// 			// throw error
-// 			std::ostringstream stream;
-// 			stream << "Unknown vector type.";
-// 			error->throwError(stream);
-// 		}
-// 	}
+//	if (beta != static_cast<double>(0.0)) {
+//		switch (hXI.getFormatType(j)) {
+//		case INDICATOR:
+//			axpy < IndicatorIterator > (hXBeta.data(), beta, j);
+//			break;
+//		case INTERCEPT:
+//		    axpy < InterceptIterator > (hXBeta.data(), beta, j);
+//		    break;
+//		case DENSE:
+//			axpy < DenseIterator > (hXBeta.data(), beta, j);
+//			break;
+//		case SPARSE:
+//			axpy < SparseIterator > (hXBeta.data(), beta, j);
+//			break;
+//		default:
+//			// throw error
+//			std::ostringstream stream;
+//			stream << "Unknown vector type.";
+//			error->throwError(stream);
+//		}
+//	}
 // }
 
 void CyclicCoordinateDescent::computeXBeta(void) {
@@ -1750,20 +2841,23 @@ void CyclicCoordinateDescent::updateXBeta(double delta, int index) {
 	modelSpecifics.updateXBeta(realDelta, index, useCrossValidation);
 }
 
-void CyclicCoordinateDescent::updateSufficientStatistics(double delta, int index) {
+double CyclicCoordinateDescent::updateSufficientStatistics(double delta, int index) {
 	updateXBeta(delta, index);
 	sufficientStatisticsKnown = true;
+	return 0.0;
 }
 
-void CyclicCoordinateDescent::updateSufficientStatistics(
-		double delta, int index, const LogisticKernelType logisticKernel) {
-	if (logisticKernel == LogisticKernelType::SPARSE_RESIDUAL) {
+double CyclicCoordinateDescent::updateSufficientStatistics(
+	double delta, int index, const LogisticKernelType logisticKernel) {
+	double fittedChange = 0.0;
+	if (isSparseResidualKernel(logisticKernel)) {
 		hBeta[index] += delta;
-		modelSpecifics.updateSparseLogisticState(delta, index, useCrossValidation);
+		fittedChange = modelSpecifics.updateSparseLogisticState(delta, index, useCrossValidation);
 	} else {
 		updateXBeta(delta, index);
 	}
 	sufficientStatisticsKnown = true;
+	return fittedChange;
 }
 
 void CyclicCoordinateDescent::computeRemainingStatistics(bool allStats, int index) { // TODO Rename
@@ -1865,6 +2959,7 @@ inline int CyclicCoordinateDescent::sign(double x) {
 }
 
 void CyclicCoordinateDescent::getFold(int fold) {
+	currentStrongRuleSlot = fold;
 	modelSpecifics.setFold(fold);
 }
 
@@ -2011,9 +3106,9 @@ std::vector<double> CyclicCoordinateDescent::getObjectiveFunctions(int convergen
 	    }
 		return logLikelihoods;
 	} else {
-    	std::ostringstream stream;
-    	stream << "Invalid convergence type: " << convergenceType;
-    	error->throwError(stream);
+	std::ostringstream stream;
+	stream << "Invalid convergence type: " << convergenceType;
+	error->throwError(stream);
     }
 	std::vector<double> result;
     return result;
@@ -2057,49 +3152,52 @@ bool CyclicCoordinateDescent::performCheckConvergence(int convergenceType,
     //bool allIllconditioned = true;
 
     if (convergenceType < ZHANG_OLES) {
-    	std::vector<double> thisObjFuncVec = getObjectiveFunctions(convergenceType);
+	std::vector<double> thisObjFuncVec = getObjectiveFunctions(convergenceType);
 
-//    	std::cout << "thisObjFunc " << iteration << ": ";
+//	std::cout << "thisObjFunc " << iteration << ": ";
 //        for (auto x : thisObjFuncVec) {
 //            std::cout << " " << x;
 //        }
 //        std::cout << '\n';
 
-    	//std::cout << "ObjFunc" << convergenceType << ": " << thisObjFunc << '\n';
-    	bool needsUpdate = false;
-    	for (int cvIndex = 0; cvIndex < syncCVFolds; cvIndex++) {
-    		if (thisObjFuncVec[cvIndex] != thisObjFuncVec[cvIndex]) {
-    			std::ostringstream stream;
-    			stream << "\nWarning: problem is ill-conditioned for this choice of\n"
-    					<< "\t prior (" << jointPrior->getDescription() << ") or\n"
+	//std::cout << "ObjFunc" << convergenceType << ": " << thisObjFunc << '\n';
+	bool needsUpdate = false;
+	for (int cvIndex = 0; cvIndex < syncCVFolds; cvIndex++) {
+		if (thisObjFuncVec[cvIndex] != thisObjFuncVec[cvIndex]) {
+			std::ostringstream stream;
+			stream << "\nWarning: problem is ill-conditioned for this choice of\n"
+					<< "\t prior (" << jointPrior->getDescription() << ") or\n"
 						<< "\t initial bounding box (" << initialBound << ")\n"
 						<< "Enforcing convergence!";
-    			logger->writeLine(stream);
-    			conv[cvIndex] = 0.0;
-    			//illconditioned[cvIndex] = true;
-    			//illconditioned = true;
-    			//done = false;
-    		} else {
-    			illconditioned = false;
-    			conv[cvIndex] = computeConvergenceCriterion(thisObjFuncVec[cvIndex], lastObjFuncVec[cvIndex]);
-    			if (!donePool[cvIndex] && epsilon > 0 && conv[cvIndex] >= epsilon) {
-    				done = false;
-    			}
-    			if (!donePool[cvIndex] && epsilon > 0 && conv[cvIndex] < epsilon) {
-    				donePool[cvIndex] = true;
-    				needsUpdate = true;
-    				//if (usingGPU) modelSpecifics.updateDoneFolds(donePool);
-    				/*
-    				for (int j = 0; j < J; j++) {
-    					fixBetaPool[cvIndex][j] = true;
-    				}
-    				syncCVIterator.fix(cvIndex);
-    				*/
-    			}
-    		}
-    		lastObjFuncVec[cvIndex] = thisObjFuncVec[cvIndex];
-    	}
-    	if (usingGPU && needsUpdate) modelSpecifics.updateDoneFolds(donePool);
+			logger->writeLine(stream);
+			conv[cvIndex] = 0.0;
+			//illconditioned[cvIndex] = true;
+			//illconditioned = true;
+			//done = false;
+		} else {
+			illconditioned = false;
+			conv[cvIndex] = computeConvergenceCriterion(thisObjFuncVec[cvIndex], lastObjFuncVec[cvIndex]);
+			if (!donePool[cvIndex] && epsilon > 0 && conv[cvIndex] >= epsilon) {
+				done = false;
+			}
+			if (!donePool[cvIndex] && epsilon > 0 && conv[cvIndex] < epsilon) {
+				donePool[cvIndex] = true;
+				needsUpdate = true;
+				//if (usingGPU) modelSpecifics.updateDoneFolds(donePool);
+				/*
+				for (int j = 0; j < J; j++) {
+					fixBetaPool[cvIndex][j] = true;
+				}
+				syncCVIterator.fix(cvIndex);
+				*/
+			}
+		}
+		lastObjFuncVec[cvIndex] = thisObjFuncVec[cvIndex];
+	}
+		if (!conv.empty()) {
+			lastConvergenceCriterion = *std::max_element(conv.begin(), conv.end());
+		}
+	if (usingGPU && needsUpdate) modelSpecifics.updateDoneFolds(donePool);
     } else { // TODO ZHANG_OLES
         //conv = computeZhangOlesConvergenceCriterion();
         //saveXBeta();
@@ -2107,19 +3205,19 @@ bool CyclicCoordinateDescent::performCheckConvergence(int convergenceType,
     // since these copy over XBeta
 
     if (illconditioned) {
-    	done = true;
+	done = true;
 		lastReturnFlag = ILLCONDITIONED;
     } else if (done) {
-    	if (noiseLevel > SILENT) {
-    		stream << "Reached convergence criterion";
-    	}
-    	lastReturnFlag = SUCCESS;
+	if (noiseLevel > SILENT) {
+		stream << "Reached convergence criterion";
+	}
+	lastReturnFlag = SUCCESS;
     } else if (iteration > maxIterations) {
-    	if (noiseLevel > SILENT) {
-    		stream << "Reached maximum iterations";
-    	}
-    	done = true;
-    	lastReturnFlag = MAX_ITERATIONS;
+	if (noiseLevel > SILENT) {
+		stream << "Reached maximum iterations";
+	}
+	done = true;
+	lastReturnFlag = MAX_ITERATIONS;
     }
 
     if (noiseLevel > QUIET) {

@@ -33,8 +33,151 @@ ModelData<RealType>::ModelData(
     loggers::ProgressLoggerPtr _log,
     loggers::ErrorHandlerPtr _error
     ) : modelType(_modelType), nPatients(0), nStrata(0), hasOffsetCovariate(false), hasInterceptCovariate(false), isFinalized(false),
+        nTypes(1), maxCovariateId(0),
         lastStratumMap(0,0), sparseIndexer(X), log(_log), error(_error), touchedY(true), touchedX(true) {
 	// Do nothing
+}
+
+template <typename RealType>
+ModelData<RealType>* ModelData<RealType>::createRowSubsetFromBinaryWeights(
+		const std::vector<double>& weights,
+		bool copyRowLabels,
+		std::vector<int>* keptRowsOut) const {
+	const auto sourceRows = getNumberOfRows();
+	if (weights.size() != sourceRows) {
+		return nullptr;
+	}
+
+	std::vector<int> rowMap(sourceRows, -1);
+	std::vector<int> keptRows;
+	keptRows.reserve(sourceRows);
+
+	for (size_t row = 0; row < sourceRows; ++row) {
+		if (weights[row] == 0.0) {
+			continue;
+		}
+		if (weights[row] != 1.0) {
+			return nullptr;
+		}
+		rowMap[row] = static_cast<int>(keptRows.size());
+		keptRows.push_back(static_cast<int>(row));
+	}
+	if (keptRowsOut != nullptr) {
+		*keptRowsOut = keptRows;
+	}
+
+	std::vector<int> subsetPid;
+	subsetPid.reserve(keptRows.size());
+	if (pid.empty()) {
+		for (size_t row = 0; row < keptRows.size(); ++row) {
+			subsetPid.push_back(static_cast<int>(row));
+		}
+	} else {
+		const auto sourcePid = getPidVectorSTL();
+		int currentPid = -1;
+		int newPid = -1;
+		for (const auto oldRow : keptRows) {
+			const int oldPid = sourcePid[oldRow];
+			if (oldPid != currentPid) {
+				currentPid = oldPid;
+				++newPid;
+			}
+			subsetPid.push_back(newPid);
+		}
+	}
+
+	RealVector subsetY;
+	subsetY.reserve(keptRows.size());
+	for (const auto oldRow : keptRows) {
+		subsetY.push_back(y[oldRow]);
+	}
+
+	RealVector subsetZ;
+	if (!z.empty()) {
+		subsetZ.reserve(keptRows.size());
+		for (const auto oldRow : keptRows) {
+			subsetZ.push_back(z[oldRow]);
+		}
+	}
+
+	RealVector subsetOffs;
+	if (!offs.empty()) {
+		subsetOffs.reserve(keptRows.size());
+		for (const auto oldRow : keptRows) {
+			subsetOffs.push_back(offs[oldRow]);
+		}
+	}
+
+	auto* subset = new ModelData<RealType>(
+			modelType, subsetPid, subsetY, subsetZ, subsetOffs, log, error);
+	subset->hasOffsetCovariate = hasOffsetCovariate;
+	subset->hasInterceptCovariate = hasInterceptCovariate;
+	subset->isFinalized = isFinalized;
+	subset->nTypes = nTypes;
+	subset->maxCovariateId = maxCovariateId;
+	subset->conditionId = conditionId;
+	subset->X.nRows = keptRows.size();
+
+	if (copyRowLabels && labels.size() == sourceRows) {
+		subset->labels.reserve(keptRows.size());
+		for (const auto oldRow : keptRows) {
+			subset->labels.push_back(labels[oldRow]);
+		}
+	}
+
+	for (size_t column = 0; column < X.getNumberOfColumns(); ++column) {
+		const auto format = X.getFormatType(static_cast<int>(column));
+		if (format == DENSE) {
+			const auto& sourceData = X.getDataVectorSTL(static_cast<int>(column));
+			if (sourceData.size() != sourceRows) {
+				delete subset;
+				return nullptr;
+			}
+			auto subsetData = make_shared<RealVector>();
+			subsetData->reserve(keptRows.size());
+			for (const auto oldRow : keptRows) {
+				subsetData->push_back(sourceData[oldRow]);
+			}
+			subset->X.push_back(nullptr, subsetData, DENSE);
+		} else if (format == SPARSE) {
+			const auto& sourceColumnRows = X.getCompressedColumnVectorSTL(static_cast<int>(column));
+			const auto& sourceData = X.getDataVectorSTL(static_cast<int>(column));
+			if (sourceData.size() != sourceColumnRows.size()) {
+				delete subset;
+				return nullptr;
+			}
+			auto subsetRows = make_shared<IntVector>();
+			auto subsetData = make_shared<RealVector>();
+			subsetRows->reserve(sourceColumnRows.size());
+			subsetData->reserve(sourceData.size());
+			for (size_t k = 0; k < sourceColumnRows.size(); ++k) {
+				const int newRow = rowMap[sourceColumnRows[k]];
+				if (newRow >= 0) {
+					subsetRows->push_back(newRow);
+					subsetData->push_back(sourceData[k]);
+				}
+			}
+			subset->X.push_back(subsetRows, subsetData, SPARSE);
+		} else if (format == INDICATOR) {
+			const auto& sourceColumnRows = X.getCompressedColumnVectorSTL(static_cast<int>(column));
+			auto subsetRows = make_shared<IntVector>();
+			subsetRows->reserve(sourceColumnRows.size());
+			for (const auto oldRow : sourceColumnRows) {
+				const int newRow = rowMap[oldRow];
+				if (newRow >= 0) {
+					subsetRows->push_back(newRow);
+				}
+			}
+			subset->X.push_back(subsetRows, nullptr, INDICATOR);
+		} else if (format == INTERCEPT) {
+			subset->X.push_back(INTERCEPT);
+		}
+
+		subset->X.getColumn(subset->X.getNumberOfColumns() - 1).add_label(
+				X.getColumn(column).getNumericalLabel());
+	}
+
+	return subset;
 }
 
 template <typename RealType>

@@ -69,9 +69,12 @@ protected:
 
 	double computeStDev(const std::vector<double>& value, double mean);
 
-	MaxPoint maxPoint;
-	std::vector<double>* weightsExclude;
-};
+		MaxPoint maxPoint;
+		std::vector<double>* weightsExclude;
+		std::vector<bsccs::unique_ptr<CyclicCoordinateDescent>> foldLocalCcdPool;
+		std::vector<bsccs::unique_ptr<CyclicCoordinateDescent>> foldLocalValidationCcdPool;
+		std::vector<char> foldLocalUnavailable;
+	};
 
 } // namespace
 

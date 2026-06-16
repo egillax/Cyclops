@@ -28,7 +28,17 @@ createControl(
   algorithm = "ccd",
   doItAll = TRUE,
   syncCV = FALSE,
-  logisticKernel = "auto"
+  logisticKernel = "auto",
+  sparseConvergenceType = "auto",
+  sparseActiveKktTolerance = -1,
+  sparseActiveKktMovementTolerance = -1,
+  sparseActiveKktPolishTolerance = -1,
+  sparseActiveKktCheckEvery = 1,
+  cvPolishPolicy = "none",
+  cvPolishTolerance = -1,
+  cvPolishMaxIterations = -1,
+  cvPolishInitialCandidates = 1,
+  cvPolishStopProposal = TRUE
 )
 }
 \arguments{
@@ -84,7 +94,27 @@ the average number of rows per stratum is smaller than the number of strata.}
 
 \item{syncCV}{Currently unused}
 
-\item{logisticKernel}{String: logistic CCD kernel (\code{"auto"}, \code{"sparse-residual"}, \code{"legacy"})}
+\item{logisticKernel}{String: logistic CCD kernel (\code{"auto"}, \code{"sparse-residual"}, \code{"sparse-residual-active"}, \code{"sparse-residual-strong"}, \code{"sparse-residual-active-strong"}, \code{"legacy"})}
+
+\item{sparseConvergenceType}{String: experimental sparse-logistic convergence criterion (\code{"auto"}, \code{"fitted-change"}, \code{"coordinate-impact"})}
+
+\item{sparseActiveKktTolerance}{Numeric: experimental active-coordinate KKT tolerance for sparse-logistic convergence; negative disables the gate}
+
+\item{sparseActiveKktMovementTolerance}{Numeric: experimental movement tolerance before active-KKT checks are allowed; negative uses \code{tolerance}}
+
+\item{sparseActiveKktPolishTolerance}{Numeric: experimental active-KKT tolerance for polish solves; negative reuses \code{sparseActiveKktTolerance}}
+
+\item{sparseActiveKktCheckEvery}{Integer: experimental active-KKT check period once the movement criterion is small enough}
+
+\item{cvPolishPolicy}{String: CV polish policy (\code{"none"}, \code{"selective"}, or \code{"all"})}
+
+\item{cvPolishTolerance}{Numeric: stricter tolerance used for CV polish and final selected-variance fit}
+
+\item{cvPolishMaxIterations}{Integer: maximum iterations for polish solves; negative reuses \code{maxIterations}}
+
+\item{cvPolishInitialCandidates}{Integer: number of initial auto-search candidates to polish under selective CV polish}
+
+\item{cvPolishStopProposal}{Logical: polish the final proposed auto-search stopping variance under selective CV polish}
 }
 \value{
 A Cyclops control object of class inheriting from \code{"cyclopsControl"} for use with \code{\link{fitCyclopsModel}}.

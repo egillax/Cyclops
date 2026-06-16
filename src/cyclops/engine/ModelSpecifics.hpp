@@ -14,6 +14,13 @@
 #include <numeric>
 #include <limits>
 #include <deque>
+#include <chrono>
+#include <fstream>
+#include <mutex>
+
+#if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
+#include <immintrin.h>
+#endif
 
 #include "ModelSpecifics.h"
 #include "Iterators.h"
@@ -67,6 +74,99 @@ namespace bsccs {
     using std::endl;
 #endif
 
+inline bool sparseLogisticAvx2GatherEnabled() {
+	static const bool enabled = []() {
+		const char* env = std::getenv("CYCLOPS_AVX2_GATHER_GH");
+		if (env != nullptr && env[0] == '0') {
+			return false;
+		}
+#if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
+		__builtin_cpu_init();
+		return __builtin_cpu_supports("avx2") != 0;
+#else
+		return false;
+#endif
+	}();
+	return enabled;
+}
+
+#if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
+__attribute__((target("avx2")))
+inline void sparseLogisticAvx2IndicatorGradientHessianDouble(
+		const int* rows,
+		const double* fitted,
+		size_t n,
+		bool computeHessian,
+		double& gradient,
+		double& hessian) {
+	const __m256d one = _mm256_set1_pd(1.0);
+	__m256d gradientVector = _mm256_setzero_pd();
+	__m256d hessianVector = _mm256_setzero_pd();
+	size_t row = 0;
+	for (; row + 3 < n; row += 4) {
+		const __m128i rowIndex =
+				_mm_loadu_si128(reinterpret_cast<const __m128i*>(rows + row));
+		const __m256d p = _mm256_i32gather_pd(fitted, rowIndex, 8);
+		gradientVector = _mm256_add_pd(gradientVector, p);
+		if (computeHessian) {
+			hessianVector = _mm256_add_pd(
+					hessianVector,
+					_mm256_mul_pd(p, _mm256_sub_pd(one, p)));
+		}
+	}
+	double partial[4];
+	_mm256_storeu_pd(partial, gradientVector);
+	gradient += partial[0] + partial[1] + partial[2] + partial[3];
+	if (computeHessian) {
+		_mm256_storeu_pd(partial, hessianVector);
+		hessian += partial[0] + partial[1] + partial[2] + partial[3];
+	}
+	for (; row < n; ++row) {
+		const double p = fitted[rows[row]];
+		gradient += p;
+		if (computeHessian) {
+			hessian += p * (1.0 - p);
+		}
+	}
+}
+#endif
+
+template <typename RealType>
+inline bool sparseLogisticTryAvx2IndicatorGradientHessian(
+		const int*,
+		const RealType*,
+		size_t,
+		bool,
+		RealType&,
+		RealType&) {
+	return false;
+}
+
+inline bool sparseLogisticTryAvx2IndicatorGradientHessian(
+		const int* rows,
+		const double* fitted,
+		size_t n,
+		bool computeHessian,
+		double& gradient,
+		double& hessian) {
+#if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
+	if (!sparseLogisticAvx2GatherEnabled()) {
+		return false;
+	}
+	sparseLogisticAvx2IndicatorGradientHessianDouble(
+			rows, fitted, n, computeHessian, gradient, hessian);
+	return true;
+#else
+	(void) rows;
+	(void) fitted;
+	(void) n;
+	(void) computeHessian;
+	(void) gradient;
+	(void) hessian;
+	return false;
+#endif
+}
+
 #define NEW_LOOPS
 
 template <class BaseModel,typename RealType>
@@ -78,7 +178,9 @@ ModelSpecifics<BaseModel,RealType>::ModelSpecifics(const ModelData<RealType>& in
    sparseLogisticWeightedRowsHaveUnitWeight(false),
    sparseLogisticStateReady(false),
    sparseLogisticXBetaDirty(false),
-   sparseLogisticExpXBetaDirty(false)
+   sparseLogisticExpXBetaDirty(false),
+   sparseIndicesReady(false),
+   sparseLogisticPerformanceCounters()
    // hY(input.getYVectorRef()),
    // hOffs(input.getTimeVectorRef())
  //  hPidOriginal(input.getPidVectorRef()), hPid(const_cast<int*>(hPidOriginal.data())),
@@ -744,10 +846,14 @@ double ModelSpecifics<BaseModel,RealType>::getPredictiveLogLikelihood(double* we
 	} else if (sparseLogisticXBetaDirty && std::is_same<BaseModel, LogisticRegression<RealType>>::value) {
 		for (const int k : sparseLogisticCaseRows) {
 			if (weights[k] != static_cast<RealType>(0.0)) {
-				logLikelihood += weights[k] * (
-					sparseLogisticLogOdds(sparseLogisticFitted[k])
-					- sparseLogisticLogDenominator(sparseLogisticFitted[k])
-				);
+				logLikelihood += weights[k] *
+					sparseLogisticLogOdds(sparseLogisticFitted[k]);
+			}
+		}
+		for (size_t k = 0; k < K; ++k) {
+			if (weights[k] != static_cast<RealType>(0.0)) {
+				logLikelihood -= weights[k] *
+					sparseLogisticLogDenominator(sparseLogisticFitted[k]);
 			}
 		}
 	} else { // TODO Unnecessary code duplication
@@ -960,6 +1066,455 @@ bool ModelSpecifics<BaseModel,RealType>::supportsSparseLogisticKernel(int index,
 }
 
 template <class BaseModel,typename RealType>
+size_t ModelSpecifics<BaseModel,RealType>::getSparseLogisticColumnScanSize(int index, bool useWeights) {
+	if (!supportsSparseLogisticKernel(index, useWeights)) {
+		return hX.getNumberOfEntries(index);
+	}
+	ensureSparseLogisticColumnFormat();
+	if (useWeights) {
+		ensureSparseLogisticWeightedColumnViews();
+		switch (sparseLogisticColumnFormat[index]) {
+			case INDICATOR:
+			case SPARSE:
+				return sparseLogisticWeightedColumnViews[index].rows.size();
+			case DENSE:
+			case INTERCEPT:
+				return sparseLogisticWeightedRows.size();
+		}
+	}
+	switch (sparseLogisticColumnFormat[index]) {
+		case INDICATOR:
+		case SPARSE:
+			return hX.getNumberOfEntries(index);
+		case DENSE:
+		case INTERCEPT:
+			return K;
+	}
+	return 0;
+}
+
+template <class BaseModel,typename RealType>
+SparseLogisticPerformanceCounters ModelSpecifics<BaseModel,RealType>::getSparseLogisticPerformanceCounters() const {
+	return sparseLogisticPerformanceCounters;
+}
+
+template <class BaseModel,typename RealType>
+void ModelSpecifics<BaseModel,RealType>::resetSparseLogisticPerformanceCounters() {
+	sparseLogisticPerformanceCounters = SparseLogisticPerformanceCounters();
+}
+
+template <class BaseModel,typename RealType>
+void ModelSpecifics<BaseModel,RealType>::addSparseLogisticKktScan(size_t nnz, double seconds) {
+	sparseLogisticPerformanceCounters.fullKktScans += 1;
+	sparseLogisticPerformanceCounters.kktGradientCalls += 1;
+	sparseLogisticPerformanceCounters.nnzKkt += nnz;
+	sparseLogisticPerformanceCounters.kktSeconds += seconds;
+}
+
+template <class BaseModel,typename RealType>
+GapSafeDiagnostic ModelSpecifics<BaseModel,RealType>::computeSparseLogisticGapSafeDiagnostic(
+		const std::vector<double>& boundaries,
+		const std::vector<bool>& fixedBeta,
+		const std::vector<double>& beta,
+		double penalty,
+		bool useWeights) {
+	GapSafeDiagnostic diagnostic;
+	const auto start = std::chrono::steady_clock::now();
+	if (!std::is_same<BaseModel, LogisticRegression<RealType>>::value
+			|| boundaries.size() != static_cast<size_t>(J)
+			|| fixedBeta.size() != static_cast<size_t>(J)
+			|| beta.size() != static_cast<size_t>(J)) {
+		return diagnostic;
+	}
+	refreshSparseLogisticState(useWeights);
+	ensureSparseLogisticColumnFormat();
+	if (useWeights) {
+		ensureSparseLogisticWeightedColumnViews();
+	}
+
+	const RealType one = static_cast<RealType>(1.0);
+	const RealType zero = static_cast<RealType>(0.0);
+	const RealType eps = std::numeric_limits<RealType>::epsilon();
+	const RealType* fitted = sparseLogisticFitted.data();
+	const RealType* weights = hKWeight.data();
+	auto clampProbability = [eps, one](RealType p) {
+		if (p < eps) {
+			return eps;
+		}
+		const RealType upper = one - eps;
+		if (p > upper) {
+			return upper;
+		}
+		return p;
+	};
+	auto entropyTerm = [](const long double q) {
+		if (q <= 0.0L || q >= 1.0L) {
+			return 0.0L;
+		}
+		return q * std::log(q) + (1.0L - q) * std::log(1.0L - q);
+	};
+
+	long double loss = 0.0L;
+	long double weightedCases = 0.0L;
+	long double totalWeight = 0.0L;
+	RealType maxWeight = zero;
+	for (size_t i = 0; i < K; ++i) {
+		const RealType w = useWeights ? weights[i] : one;
+		if (w == zero) {
+			continue;
+		}
+		maxWeight = std::max(maxWeight, w);
+		totalWeight += static_cast<long double>(w);
+		weightedCases += static_cast<long double>(w) * static_cast<long double>(hY[i]);
+		const RealType p = clampProbability(fitted[i]);
+		const RealType y = hY[i];
+		loss -= static_cast<long double>(w)
+			* (static_cast<long double>(y) * std::log(static_cast<long double>(p))
+					+ static_cast<long double>(one - y)
+						* std::log1p(-static_cast<long double>(p)));
+	}
+	diagnostic.primalObjective = static_cast<double>(loss + static_cast<long double>(penalty));
+
+	std::vector<RealType> dualProbability(K, zero);
+	if (totalWeight > 0.0L) {
+		auto shiftedCaseTotal = [&](const long double shift) {
+			long double total = 0.0L;
+			for (size_t i = 0; i < K; ++i) {
+				const RealType w = useWeights ? weights[i] : one;
+				if (w == zero) {
+					continue;
+				}
+				const RealType p = clampProbability(fitted[i]);
+				const long double logit =
+					std::log(static_cast<long double>(p))
+					- std::log1p(-static_cast<long double>(p));
+				const long double eta = logit + shift;
+				const long double q = eta >= 0.0L
+					? 1.0L / (1.0L + std::exp(-eta))
+					: std::exp(eta) / (1.0L + std::exp(eta));
+				total += static_cast<long double>(w) * q;
+			}
+			return total;
+		};
+		long double lower = -50.0L;
+		long double upper = 50.0L;
+		for (int expand = 0; expand < 4 && shiftedCaseTotal(lower) > weightedCases; ++expand) {
+			lower *= 2.0L;
+		}
+		for (int expand = 0; expand < 4 && shiftedCaseTotal(upper) < weightedCases; ++expand) {
+			upper *= 2.0L;
+		}
+		for (int iter = 0; iter < 80; ++iter) {
+			const long double mid = (lower + upper) / 2.0L;
+			if (shiftedCaseTotal(mid) < weightedCases) {
+				lower = mid;
+			} else {
+				upper = mid;
+			}
+		}
+		const long double shift = (lower + upper) / 2.0L;
+		for (size_t i = 0; i < K; ++i) {
+			const RealType w = useWeights ? weights[i] : one;
+			if (w == zero) {
+				dualProbability[i] = hY[i];
+				continue;
+			}
+			const RealType p = clampProbability(fitted[i]);
+			const long double logit =
+				std::log(static_cast<long double>(p))
+				- std::log1p(-static_cast<long double>(p));
+			const long double eta = logit + shift;
+			const long double q = eta >= 0.0L
+				? 1.0L / (1.0L + std::exp(-eta))
+				: std::exp(eta) / (1.0L + std::exp(eta));
+			dualProbability[i] = static_cast<RealType>(q);
+		}
+	}
+
+	struct ColumnDiagnostic {
+		double gradient = 0.0;
+		double norm2 = 0.0;
+		double sum = 0.0;
+		size_t nnz = 0;
+	};
+	auto scanColumn = [&](const int j) {
+		ColumnDiagnostic column;
+		long double gradient = 0.0L;
+		long double norm2 = 0.0L;
+		long double sum = 0.0L;
+		switch (sparseLogisticColumnFormat[j]) {
+			case INDICATOR: {
+				const SparseLogisticWeightedColumnView* view =
+					useWeights ? &sparseLogisticWeightedColumnViews[j] : nullptr;
+				const int* rows = useWeights ? view->rows.data() : hX.getCompressedColumnVector(j);
+				const size_t n = useWeights ? view->rows.size() : hX.getNumberOfEntries(j);
+				column.nnz = n;
+				for (size_t row = 0; row < n; ++row) {
+					const int i = rows[row];
+					const RealType w = (useWeights && !sparseLogisticWeightedRowsHaveUnitWeight)
+						? weights[i]
+						: one;
+					gradient += static_cast<long double>(w) * dualProbability[i];
+					norm2 += 1.0L;
+					sum += 1.0L;
+				}
+				break;
+			}
+			case SPARSE: {
+				const SparseLogisticWeightedColumnView* view =
+					useWeights ? &sparseLogisticWeightedColumnViews[j] : nullptr;
+				const int* rows = useWeights ? view->rows.data() : hX.getCompressedColumnVector(j);
+				const RealType* values = useWeights ? view->values.data() : hX.getDataVector(j);
+				const size_t n = useWeights ? view->rows.size() : hX.getNumberOfEntries(j);
+				column.nnz = n;
+				for (size_t row = 0; row < n; ++row) {
+					const int i = rows[row];
+					const RealType x = values[row];
+					const RealType w = (useWeights && !sparseLogisticWeightedRowsHaveUnitWeight)
+						? weights[i]
+						: one;
+					gradient += static_cast<long double>(w) * x * dualProbability[i];
+					norm2 += static_cast<long double>(x) * x;
+					sum += static_cast<long double>(x);
+				}
+				break;
+			}
+			case DENSE: {
+				const RealType* values = hX.getDataVector(j);
+				const size_t n = useWeights ? sparseLogisticWeightedRows.size() : K;
+				column.nnz = n;
+				for (size_t row = 0; row < n; ++row) {
+					const int i = useWeights ? sparseLogisticWeightedRows[row] : static_cast<int>(row);
+					const RealType x = values[i];
+					const RealType w = (useWeights && !sparseLogisticWeightedRowsHaveUnitWeight)
+						? weights[i]
+						: one;
+					gradient += static_cast<long double>(w) * x * dualProbability[i];
+					norm2 += static_cast<long double>(x) * x;
+					sum += static_cast<long double>(x);
+				}
+				break;
+			}
+			case INTERCEPT: {
+				const size_t n = useWeights ? sparseLogisticWeightedRows.size() : K;
+				column.nnz = n;
+				for (size_t row = 0; row < n; ++row) {
+					const int i = useWeights ? sparseLogisticWeightedRows[row] : static_cast<int>(row);
+					const RealType w = (useWeights && !sparseLogisticWeightedRowsHaveUnitWeight)
+						? weights[i]
+						: one;
+					gradient += static_cast<long double>(w) * dualProbability[i];
+					norm2 += 1.0L;
+					sum += 1.0L;
+				}
+				break;
+			}
+		}
+		gradient -= hXjY[j];
+		column.gradient = static_cast<double>(gradient);
+		column.norm2 = static_cast<double>(norm2);
+		column.sum = static_cast<double>(sum);
+		return column;
+	};
+
+	std::vector<ColumnDiagnostic> columns(J);
+	double maxGradientRatio = 0.0;
+	double maxUnpenalizedGradient = 0.0;
+	for (int j = 0; j < J; ++j) {
+		columns[j] = scanColumn(j);
+		diagnostic.totalColumns += fixedBeta[j] ? 0 : 1;
+		diagnostic.totalNnz += fixedBeta[j] ? 0 : columns[j].nnz;
+		if (fixedBeta[j]) {
+			continue;
+		}
+		const double boundary = boundaries[j];
+		if (boundary > 0.0) {
+			maxGradientRatio = std::max(maxGradientRatio,
+					std::abs(columns[j].gradient) / boundary);
+			if (beta[j] == 0.0) {
+				diagnostic.eligibleColumns += 1;
+				diagnostic.eligibleNnz += columns[j].nnz;
+			}
+		} else {
+			maxUnpenalizedGradient = std::max(maxUnpenalizedGradient,
+					std::abs(columns[j].gradient));
+		}
+	}
+
+	const char* unpenalizedToleranceEnv = std::getenv("CYCLOPS_GAP_SAFE_UNPENALIZED_TOLERANCE");
+	const double unpenalizedTolerance = unpenalizedToleranceEnv != nullptr
+		? std::atof(unpenalizedToleranceEnv)
+		: 1e-6;
+	diagnostic.maxGradientRatio = maxGradientRatio;
+	diagnostic.maxUnpenalizedGradient = maxUnpenalizedGradient;
+	diagnostic.dualFeasible = maxUnpenalizedGradient <= unpenalizedTolerance;
+	diagnostic.dualScale = diagnostic.dualFeasible
+		? (maxGradientRatio > 1.0 ? 1.0 / maxGradientRatio : 1.0)
+		: 0.0;
+
+	long double conjugate = 0.0L;
+	for (size_t i = 0; i < K; ++i) {
+		const RealType w = useWeights ? weights[i] : one;
+		if (w == zero) {
+			continue;
+		}
+		long double q = static_cast<long double>(hY[i])
+			+ static_cast<long double>(diagnostic.dualScale)
+				* (static_cast<long double>(dualProbability[i]) - static_cast<long double>(hY[i]));
+		if (q < 0.0L) {
+			q = 0.0L;
+		} else if (q > 1.0L) {
+			q = 1.0L;
+		}
+		conjugate += static_cast<long double>(w) * entropyTerm(q);
+	}
+	diagnostic.dualObjective = static_cast<double>(-conjugate);
+	diagnostic.dualityGap = diagnostic.primalObjective - diagnostic.dualObjective;
+	if (diagnostic.dualityGap < 0.0 && diagnostic.dualityGap > -1e-8) {
+		diagnostic.dualityGap = 0.0;
+	}
+	if (diagnostic.dualityGap < 0.0) {
+		diagnostic.dualFeasible = false;
+		diagnostic.dualScale = 0.0;
+	}
+	if (maxWeight > zero && diagnostic.dualityGap >= 0.0) {
+		diagnostic.safeRadius = std::sqrt(diagnostic.dualityGap
+				* static_cast<double>(maxWeight) / 2.0);
+	}
+	if (diagnostic.dualFeasible) {
+		for (int j = 0; j < J; ++j) {
+			if (fixedBeta[j] || boundaries[j] <= 0.0 || beta[j] != 0.0) {
+				continue;
+			}
+			const double dualCorrelation =
+				std::abs(diagnostic.dualScale * columns[j].gradient);
+			const double safeBound =
+				dualCorrelation + std::sqrt(columns[j].norm2) * diagnostic.safeRadius;
+			if (safeBound < boundaries[j]) {
+				diagnostic.screenedColumns += 1;
+				diagnostic.screenedNnz += columns[j].nnz;
+			}
+		}
+	}
+
+	const char* radiusTracePath = std::getenv("CYCLOPS_GAP_SAFE_RADIUS_TRACE");
+	if (diagnostic.dualFeasible && radiusTracePath != nullptr && radiusTracePath[0] != '\0') {
+		struct RadiusBucketCounts {
+			uint64_t columns = 0;
+			uint64_t nnz = 0;
+			uint64_t rareNnz = 0;
+			uint64_t smallNnz = 0;
+			uint64_t mediumNnz = 0;
+			uint64_t hotNnz = 0;
+		};
+		auto addBucket = [](RadiusBucketCounts& counts, const size_t nnz) {
+			counts.columns += 1;
+			counts.nnz += nnz;
+			if (nnz < 32) {
+				counts.rareNnz += nnz;
+			} else if (nnz < 256) {
+				counts.smallNnz += nnz;
+			} else if (nnz < 4096) {
+				counts.mediumNnz += nnz;
+			} else {
+				counts.hotNnz += nnz;
+			}
+		};
+		const double radiusDivisors[] = {1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 0.0};
+		std::vector<RadiusBucketCounts> uncenteredCounts(8);
+		std::vector<RadiusBucketCounts> centeredCounts(8);
+		uint64_t eligibleRareNnz = 0;
+		uint64_t eligibleSmallNnz = 0;
+		uint64_t eligibleMediumNnz = 0;
+		uint64_t eligibleHotNnz = 0;
+		for (int j = 0; j < J; ++j) {
+			if (fixedBeta[j] || boundaries[j] <= 0.0 || beta[j] != 0.0) {
+				continue;
+			}
+			if (columns[j].nnz < 32) {
+				eligibleRareNnz += columns[j].nnz;
+			} else if (columns[j].nnz < 256) {
+				eligibleSmallNnz += columns[j].nnz;
+			} else if (columns[j].nnz < 4096) {
+				eligibleMediumNnz += columns[j].nnz;
+			} else {
+				eligibleHotNnz += columns[j].nnz;
+			}
+			const double dualCorrelation =
+				std::abs(diagnostic.dualScale * columns[j].gradient);
+			const double centeredNorm2 = totalWeight > 0.0L
+				? std::max(0.0, columns[j].norm2
+						- (columns[j].sum * columns[j].sum / static_cast<double>(totalWeight)))
+				: columns[j].norm2;
+			for (size_t r = 0; r < 8; ++r) {
+				const double radius = radiusDivisors[r] == 0.0
+					? 0.0
+					: diagnostic.safeRadius / radiusDivisors[r];
+				const double uncenteredSafeBound =
+					dualCorrelation + std::sqrt(columns[j].norm2) * radius;
+				const double centeredSafeBound =
+					dualCorrelation + std::sqrt(centeredNorm2) * radius;
+				if (uncenteredSafeBound < boundaries[j]) {
+					addBucket(uncenteredCounts[r], columns[j].nnz);
+				}
+				if (centeredSafeBound < boundaries[j]) {
+					addBucket(centeredCounts[r], columns[j].nnz);
+				}
+			}
+		}
+
+		static std::mutex radiusTraceMutex;
+		std::lock_guard<std::mutex> lock(radiusTraceMutex);
+		std::ifstream existing(radiusTracePath);
+		const bool writeHeader = !existing.good() || existing.peek() == std::ifstream::traits_type::eof();
+		existing.close();
+		std::ofstream out(radiusTracePath, std::ios::app);
+		if (writeHeader) {
+			out << "centered,radius_divisor,implied_gap_factor,radius,"
+				<< "primal_objective,dual_objective,duality_gap,dual_scale,"
+				<< "eligible_columns,eligible_nnz,eligible_rare_nnz,eligible_small_nnz,"
+				<< "eligible_medium_nnz,eligible_hot_nnz,"
+				<< "screened_columns,screened_nnz,screened_rare_nnz,screened_small_nnz,"
+				<< "screened_medium_nnz,screened_hot_nnz\n";
+		}
+		out.precision(17);
+		for (size_t r = 0; r < 8; ++r) {
+			const double divisor = radiusDivisors[r];
+			const double radius = divisor == 0.0 ? 0.0 : diagnostic.safeRadius / divisor;
+			const double impliedGapFactor = divisor == 0.0 ? 0.0 : 1.0 / (divisor * divisor);
+			for (int centered = 0; centered <= 1; ++centered) {
+				const auto& counts = centered == 0 ? uncenteredCounts[r] : centeredCounts[r];
+				out << centered << ','
+					<< divisor << ','
+					<< impliedGapFactor << ','
+					<< radius << ','
+					<< diagnostic.primalObjective << ','
+					<< diagnostic.dualObjective << ','
+					<< diagnostic.dualityGap << ','
+					<< diagnostic.dualScale << ','
+					<< diagnostic.eligibleColumns << ','
+					<< diagnostic.eligibleNnz << ','
+					<< eligibleRareNnz << ','
+					<< eligibleSmallNnz << ','
+					<< eligibleMediumNnz << ','
+					<< eligibleHotNnz << ','
+					<< counts.columns << ','
+					<< counts.nnz << ','
+					<< counts.rareNnz << ','
+					<< counts.smallNnz << ','
+					<< counts.mediumNnz << ','
+					<< counts.hotNnz << '\n';
+			}
+		}
+	}
+
+	const auto end = std::chrono::steady_clock::now();
+	diagnostic.available = true;
+	diagnostic.seconds = std::chrono::duration<double>(end - start).count();
+	return diagnostic;
+}
+
+template <class BaseModel,typename RealType>
 void ModelSpecifics<BaseModel,RealType>::ensureSparseLogisticColumnFormat() {
 	const size_t columns = hX.getNumberOfColumns();
 	if (sparseLogisticColumnFormat.size() == columns) {
@@ -1000,7 +1555,6 @@ void ModelSpecifics<BaseModel,RealType>::ensureSparseLogisticWeightedColumnViews
 			}
 		}
 	}
-
 	sparseLogisticWeightedColumnViews.clear();
 	sparseLogisticWeightedColumnViews.resize(J);
 	for (int j = 0; j < static_cast<int>(J); ++j) {
@@ -1137,6 +1691,73 @@ void ModelSpecifics<BaseModel,RealType>::syncSparseLogisticState() {
 }
 
 template <class BaseModel,typename RealType>
+bool ModelSpecifics<BaseModel,RealType>::initializeXBetaFromRowSubset(
+		const std::vector<double>& sourceXBeta,
+		const std::vector<int>& keptRows) {
+	if (keptRows.size() != K) {
+		return false;
+	}
+	for (size_t i = 0; i < K; ++i) {
+		const int oldRow = keptRows[i];
+		if (oldRow < 0 || static_cast<size_t>(oldRow) >= sourceXBeta.size()) {
+			return false;
+		}
+		hXBeta[i] = static_cast<RealType>(sourceXBeta[oldRow]);
+	}
+	sparseLogisticStateReady = false;
+	sparseLogisticXBetaDirty = false;
+	sparseLogisticExpXBetaDirty = false;
+	return true;
+}
+
+template <class BaseModel,typename RealType>
+bool ModelSpecifics<BaseModel,RealType>::initializeSparseLogisticStateFromRowSubset(
+		const AbstractModelSpecifics& source,
+		const std::vector<int>& keptRows) {
+	if (!std::is_same<BaseModel, LogisticRegression<RealType>>::value
+			|| keptRows.size() != K) {
+		return false;
+	}
+	const auto* typedSource =
+			dynamic_cast<const ModelSpecifics<BaseModel,RealType>*>(&source);
+	if (typedSource == nullptr
+			|| !typedSource->sparseLogisticStateReady
+			|| typedSource->sparseLogisticFitted.empty()) {
+		return false;
+	}
+	ensureSparseLogisticColumnFormat();
+	if (sparseLogisticFitted.size() != K) {
+		sparseLogisticFitted.resize(K);
+	}
+	for (size_t i = 0; i < K; ++i) {
+		const int oldRow = keptRows[i];
+		if (oldRow < 0
+				|| static_cast<size_t>(oldRow) >= typedSource->sparseLogisticFitted.size()) {
+			sparseLogisticStateReady = false;
+			return false;
+		}
+		sparseLogisticFitted[i] = typedSource->sparseLogisticFitted[oldRow];
+	}
+	sparseLogisticCaseRows.clear();
+	sparseLogisticCaseRows.reserve(K);
+	for (size_t i = 0; i < K; ++i) {
+		if (hY[i] != static_cast<RealType>(0.0)) {
+			sparseLogisticCaseRows.push_back(static_cast<int>(i));
+		}
+	}
+	sparseLogisticStateReady = true;
+	sparseLogisticXBetaDirty = true;
+	sparseLogisticExpXBetaDirty = true;
+	return true;
+}
+
+template <class BaseModel,typename RealType>
+bool ModelSpecifics<BaseModel,RealType>::hasSparseLogisticStateReady() const {
+	return std::is_same<BaseModel, LogisticRegression<RealType>>::value
+			&& sparseLogisticStateReady;
+}
+
+template <class BaseModel,typename RealType>
 void ModelSpecifics<BaseModel,RealType>::computeSparseLogisticGradientAndHessian(
 		int index, double *ogradient, double *ohessian, bool useWeights) {
 	if (!supportsSparseLogisticKernel(index, useWeights)) {
@@ -1144,73 +1765,121 @@ void ModelSpecifics<BaseModel,RealType>::computeSparseLogisticGradientAndHessian
 		return;
 	}
 
-	refreshSparseLogisticState(useWeights);
-	if (useWeights) {
-		ensureSparseLogisticWeightedColumnViews();
+	static const bool profileSparseLogisticHotLoops = []() {
+		const char* env = std::getenv("CYCLOPS_SPARSE_LOGISTIC_PROFILE");
+		return env != nullptr && env[0] != '\0' && env[0] != '0';
+	}();
+	std::chrono::steady_clock::time_point perfStart;
+	if (profileSparseLogisticHotLoops) {
+		perfStart = std::chrono::steady_clock::now();
 	}
+	refreshSparseLogisticState(useWeights);
 	const RealType* fitted = sparseLogisticFitted.data();
 	const RealType* weights = hKWeight.data();
 	const RealType one = static_cast<RealType>(1.0);
+	const bool computeHessian = ohessian != nullptr;
 
-	RealType gradient = static_cast<RealType>(0.0);
-	RealType hessian = static_cast<RealType>(0.0);
+		RealType gradient = static_cast<RealType>(0.0);
+		RealType hessian = static_cast<RealType>(0.0);
 
 	switch (sparseLogisticColumnFormat[index]) {
 		case INDICATOR: {
 			const SparseLogisticWeightedColumnView* view =
 				useWeights ? &sparseLogisticWeightedColumnViews[index] : nullptr;
 			const int* rows = useWeights ? view->rows.data() : hX.getCompressedColumnVector(index);
-			const size_t n = useWeights ? view->rows.size() : hX.getNumberOfEntries(index);
-			RealType gradient0 = static_cast<RealType>(0.0);
-			RealType gradient1 = static_cast<RealType>(0.0);
-			RealType gradient2 = static_cast<RealType>(0.0);
-			RealType gradient3 = static_cast<RealType>(0.0);
-			RealType hessian0 = static_cast<RealType>(0.0);
-			RealType hessian1 = static_cast<RealType>(0.0);
-			RealType hessian2 = static_cast<RealType>(0.0);
-			RealType hessian3 = static_cast<RealType>(0.0);
-			size_t row = 0;
-			for (; row + 3 < n; row += 4) {
-				const int i0 = rows[row];
-				const int i1 = rows[row + 1];
-				const int i2 = rows[row + 2];
-				const int i3 = rows[row + 3];
-				const RealType p0 = fitted[i0];
-				const RealType p1 = fitted[i1];
-				const RealType p2 = fitted[i2];
-				const RealType p3 = fitted[i3];
-				if (useWeights) {
-					const RealType w0 = sparseLogisticWeightedRowsHaveUnitWeight ? one : weights[i0];
-					const RealType w1 = sparseLogisticWeightedRowsHaveUnitWeight ? one : weights[i1];
-					const RealType w2 = sparseLogisticWeightedRowsHaveUnitWeight ? one : weights[i2];
-					const RealType w3 = sparseLogisticWeightedRowsHaveUnitWeight ? one : weights[i3];
-					gradient0 += w0 * p0;
-					gradient1 += w1 * p1;
-					gradient2 += w2 * p2;
-					gradient3 += w3 * p3;
-					hessian0 += w0 * p0 * (one - p0);
-					hessian1 += w1 * p1 * (one - p1);
-					hessian2 += w2 * p2 * (one - p2);
-					hessian3 += w3 * p3 * (one - p3);
-				} else {
+				const size_t n = useWeights ? view->rows.size() : hX.getNumberOfEntries(index);
+				if (!useWeights || sparseLogisticWeightedRowsHaveUnitWeight) {
+					if (!sparseLogisticTryAvx2IndicatorGradientHessian(
+							rows, fitted, n, computeHessian, gradient, hessian)) {
+						RealType gradient0 = static_cast<RealType>(0.0);
+						RealType gradient1 = static_cast<RealType>(0.0);
+						RealType gradient2 = static_cast<RealType>(0.0);
+						RealType gradient3 = static_cast<RealType>(0.0);
+						RealType hessian0 = static_cast<RealType>(0.0);
+						RealType hessian1 = static_cast<RealType>(0.0);
+						RealType hessian2 = static_cast<RealType>(0.0);
+						RealType hessian3 = static_cast<RealType>(0.0);
+						size_t row = 0;
+					for (; row + 3 < n; row += 4) {
+						const int i0 = rows[row];
+						const int i1 = rows[row + 1];
+						const int i2 = rows[row + 2];
+					const int i3 = rows[row + 3];
+					const RealType p0 = fitted[i0];
+					const RealType p1 = fitted[i1];
+					const RealType p2 = fitted[i2];
+					const RealType p3 = fitted[i3];
 					gradient0 += p0;
 					gradient1 += p1;
 					gradient2 += p2;
 					gradient3 += p3;
-					hessian0 += p0 * (one - p0);
-					hessian1 += p1 * (one - p1);
-					hessian2 += p2 * (one - p2);
-					hessian3 += p3 * (one - p3);
+					if (computeHessian) {
+						hessian0 += p0 * (one - p0);
+						hessian1 += p1 * (one - p1);
+						hessian2 += p2 * (one - p2);
+						hessian3 += p3 * (one - p3);
+					}
 				}
-			}
-			gradient += gradient0 + gradient1 + gradient2 + gradient3;
-			hessian += hessian0 + hessian1 + hessian2 + hessian3;
-			for (; row < n; ++row) {
-				const int i = rows[row];
-				const RealType p = fitted[i];
-				const RealType w = (useWeights && !sparseLogisticWeightedRowsHaveUnitWeight) ? weights[i] : one;
-				gradient += w * p;
-				hessian += w * p * (one - p);
+				gradient += gradient0 + gradient1 + gradient2 + gradient3;
+					if (computeHessian) {
+						hessian += hessian0 + hessian1 + hessian2 + hessian3;
+					}
+					for (; row < n; ++row) {
+						const int i = rows[row];
+					const RealType p = fitted[i];
+					gradient += p;
+					if (computeHessian) {
+							hessian += p * (one - p);
+						}
+					}
+					}
+				} else {
+					RealType gradient0 = static_cast<RealType>(0.0);
+				RealType gradient1 = static_cast<RealType>(0.0);
+				RealType gradient2 = static_cast<RealType>(0.0);
+				RealType gradient3 = static_cast<RealType>(0.0);
+				RealType hessian0 = static_cast<RealType>(0.0);
+				RealType hessian1 = static_cast<RealType>(0.0);
+					RealType hessian2 = static_cast<RealType>(0.0);
+					RealType hessian3 = static_cast<RealType>(0.0);
+					size_t row = 0;
+					for (; row + 3 < n; row += 4) {
+						const int i0 = rows[row];
+						const int i1 = rows[row + 1];
+						const int i2 = rows[row + 2];
+					const int i3 = rows[row + 3];
+					const RealType p0 = fitted[i0];
+					const RealType p1 = fitted[i1];
+					const RealType p2 = fitted[i2];
+					const RealType p3 = fitted[i3];
+					const RealType w0 = weights[i0];
+					const RealType w1 = weights[i1];
+					const RealType w2 = weights[i2];
+					const RealType w3 = weights[i3];
+					gradient0 += w0 * p0;
+					gradient1 += w1 * p1;
+					gradient2 += w2 * p2;
+					gradient3 += w3 * p3;
+					if (computeHessian) {
+						hessian0 += w0 * p0 * (one - p0);
+						hessian1 += w1 * p1 * (one - p1);
+						hessian2 += w2 * p2 * (one - p2);
+						hessian3 += w3 * p3 * (one - p3);
+					}
+				}
+				gradient += gradient0 + gradient1 + gradient2 + gradient3;
+				if (computeHessian) {
+					hessian += hessian0 + hessian1 + hessian2 + hessian3;
+				}
+				for (; row < n; ++row) {
+					const int i = rows[row];
+					const RealType p = fitted[i];
+					const RealType w = weights[i];
+					gradient += w * p;
+					if (computeHessian) {
+						hessian += w * p * (one - p);
+					}
+				}
 			}
 			break;
 		}
@@ -1226,7 +1895,9 @@ void ModelSpecifics<BaseModel,RealType>::computeSparseLogisticGradientAndHessian
 				const RealType p = fitted[i];
 				const RealType w = (useWeights && !sparseLogisticWeightedRowsHaveUnitWeight) ? weights[i] : one;
 				gradient += w * x * p;
-				hessian += w * x * x * p * (one - p);
+				if (computeHessian) {
+					hessian += w * x * x * p * (one - p);
+				}
 			}
 			break;
 		}
@@ -1239,7 +1910,9 @@ void ModelSpecifics<BaseModel,RealType>::computeSparseLogisticGradientAndHessian
 				const RealType p = fitted[i];
 				const RealType w = (useWeights && !sparseLogisticWeightedRowsHaveUnitWeight) ? weights[i] : one;
 				gradient += w * x * p;
-				hessian += w * x * x * p * (one - p);
+				if (computeHessian) {
+					hessian += w * x * x * p * (one - p);
+				}
 			}
 			break;
 		}
@@ -1250,7 +1923,9 @@ void ModelSpecifics<BaseModel,RealType>::computeSparseLogisticGradientAndHessian
 				const RealType p = fitted[i];
 				const RealType w = (useWeights && !sparseLogisticWeightedRowsHaveUnitWeight) ? weights[i] : one;
 				gradient += w * p;
-				hessian += w * p * (one - p);
+				if (computeHessian) {
+					hessian += w * p * (one - p);
+				}
 			}
 			break;
 		}
@@ -1258,74 +1933,132 @@ void ModelSpecifics<BaseModel,RealType>::computeSparseLogisticGradientAndHessian
 
 	gradient -= hXjY[index];
 	*ogradient = static_cast<double>(gradient);
-	*ohessian = static_cast<double>(hessian);
+	if (ohessian != nullptr) {
+		*ohessian = static_cast<double>(hessian);
+	}
+	if (profileSparseLogisticHotLoops) {
+		const auto perfEnd = std::chrono::steady_clock::now();
+		sparseLogisticPerformanceCounters.gradientHessianCalls += 1;
+		sparseLogisticPerformanceCounters.nnzGradientHessian +=
+			getSparseLogisticColumnScanSize(index, useWeights);
+		sparseLogisticPerformanceCounters.gradientHessianSeconds +=
+			std::chrono::duration<double>(perfEnd - perfStart).count();
+	}
 }
 
 template <class BaseModel,typename RealType>
-void ModelSpecifics<BaseModel,RealType>::updateSparseLogisticState(
+double ModelSpecifics<BaseModel,RealType>::updateSparseLogisticState(
 		double delta, int index, bool useWeights) {
 	if (!supportsSparseLogisticKernel(index, useWeights)) {
 		updateXBeta(delta, index, useWeights);
-		return;
+		return 0.0;
 	}
 
+	static const bool profileSparseLogisticHotLoops = []() {
+		const char* env = std::getenv("CYCLOPS_SPARSE_LOGISTIC_PROFILE");
+		return env != nullptr && env[0] != '\0' && env[0] != '0';
+	}();
+	std::chrono::steady_clock::time_point perfStart;
+	if (profileSparseLogisticHotLoops) {
+		perfStart = std::chrono::steady_clock::now();
+	}
 	refreshSparseLogisticState(useWeights);
-	const RealType realDelta = static_cast<RealType>(delta);
-	RealType* fitted = sparseLogisticFitted.data();
-	const RealType one = static_cast<RealType>(1.0);
-	const RealType zero = static_cast<RealType>(0.0);
+	static const int weightedUpdateRowsMode = []() {
+		const char* env = std::getenv("CYCLOPS_WEIGHTED_UPDATE_ROWS");
+		if (env == nullptr || env[0] == '\0') {
+			return 1; // auto
+		}
+		if (env[0] == '0') {
+			return 0; // disabled
+		}
+		return 2; // forced, for diagnostics
+	}();
+	bool useWeightedUpdateRows = false;
+		if (useWeights && weightedUpdateRowsMode != 0) {
+			ensureSparseLogisticWeightedColumnViews();
+			useWeightedUpdateRows = weightedUpdateRowsMode == 2
+				|| sparseLogisticWeightedRows.size() < K;
+		}
+		const RealType realDelta = static_cast<RealType>(delta);
+			RealType* fitted = sparseLogisticFitted.data();
+			const RealType one = static_cast<RealType>(1.0);
+		const RealType zero = static_cast<RealType>(0.0);
+		RealType fittedChange = static_cast<RealType>(0.0);
 
-	auto advanceProbability = [one, zero](const RealType p, const RealType multiplier) {
-		const RealType numerator = multiplier * p;
+		auto rowWeight = [this, useWeights, useWeightedUpdateRows, one](const int row) {
+			return (useWeights && useWeightedUpdateRows && !sparseLogisticWeightedRowsHaveUnitWeight)
+				? hKWeight[row]
+				: one;
+		};
+
+		auto advanceProbability = [one, zero](const RealType p, const RealType multiplier) {
+			const RealType numerator = multiplier * p;
 		const RealType denominator = (one - p) + numerator;
 		return denominator > zero ? numerator / denominator : one;
-	};
+		};
 
-	switch (sparseLogisticColumnFormat[index]) {
-		case INDICATOR: {
-			const RealType multiplier = std::exp(realDelta);
-			const int* rows = hX.getCompressedColumnVector(index);
-			const size_t n = hX.getNumberOfEntries(index);
-			size_t row = 0;
-			for (; row + 3 < n; row += 4) {
-				const int i0 = rows[row];
-				const int i1 = rows[row + 1];
-				const int i2 = rows[row + 2];
-				const int i3 = rows[row + 3];
-				fitted[i0] = advanceProbability(fitted[i0], multiplier);
-				fitted[i1] = advanceProbability(fitted[i1], multiplier);
-				fitted[i2] = advanceProbability(fitted[i2], multiplier);
-				fitted[i3] = advanceProbability(fitted[i3], multiplier);
-			}
-			for (; row < n; ++row) {
-				const int i = rows[row];
-				fitted[i] = advanceProbability(fitted[i], multiplier);
-			}
+		auto updateProbability = [&fitted, &fittedChange, &rowWeight, &advanceProbability](
+				const int row, const RealType multiplier) {
+			const RealType oldP = fitted[row];
+			const RealType newP = advanceProbability(oldP, multiplier);
+			const RealType diff = newP - oldP;
+			fitted[row] = newP;
+			fittedChange += rowWeight(row) * diff * diff;
+		};
+
+		switch (sparseLogisticColumnFormat[index]) {
+			case INDICATOR: {
+				const RealType multiplier = std::exp(realDelta);
+				const SparseLogisticWeightedColumnView* view =
+					useWeightedUpdateRows ? &sparseLogisticWeightedColumnViews[index] : nullptr;
+					const int* rows = useWeightedUpdateRows ? view->rows.data() : hX.getCompressedColumnVector(index);
+					const size_t n = useWeightedUpdateRows ? view->rows.size() : hX.getNumberOfEntries(index);
+				size_t row = 0;
+				for (; row + 3 < n; row += 4) {
+					const int i0 = rows[row];
+					const int i1 = rows[row + 1];
+					const int i2 = rows[row + 2];
+					const int i3 = rows[row + 3];
+					updateProbability(i0, multiplier);
+					updateProbability(i1, multiplier);
+					updateProbability(i2, multiplier);
+					updateProbability(i3, multiplier);
+				}
+				for (; row < n; ++row) {
+					const int i = rows[row];
+					updateProbability(i, multiplier);
+				}
 			break;
 		}
 		case SPARSE: {
-			const int* rows = hX.getCompressedColumnVector(index);
-			const RealType* values = hX.getDataVector(index);
-			const size_t n = hX.getNumberOfEntries(index);
+			const SparseLogisticWeightedColumnView* view =
+				useWeightedUpdateRows ? &sparseLogisticWeightedColumnViews[index] : nullptr;
+			const int* rows = useWeightedUpdateRows ? view->rows.data() : hX.getCompressedColumnVector(index);
+			const RealType* values = useWeightedUpdateRows ? view->values.data() : hX.getDataVector(index);
+			const size_t n = useWeightedUpdateRows ? view->rows.size() : hX.getNumberOfEntries(index);
 			for (size_t row = 0; row < n; ++row) {
 				const int i = rows[row];
 				const RealType multiplier = std::exp(realDelta * values[row]);
-				fitted[i] = advanceProbability(fitted[i], multiplier);
+				updateProbability(i, multiplier);
 			}
 			break;
 		}
 		case DENSE: {
 			const RealType* values = hX.getDataVector(index);
-			for (size_t i = 0; i < K; ++i) {
+			const size_t n = useWeightedUpdateRows ? sparseLogisticWeightedRows.size() : K;
+			for (size_t row = 0; row < n; ++row) {
+				const int i = useWeightedUpdateRows ? sparseLogisticWeightedRows[row] : static_cast<int>(row);
 				const RealType multiplier = std::exp(realDelta * values[i]);
-				fitted[i] = advanceProbability(fitted[i], multiplier);
+				updateProbability(i, multiplier);
 			}
 			break;
-		}
-		case INTERCEPT: {
-			const RealType multiplier = std::exp(realDelta);
-			for (size_t i = 0; i < K; ++i) {
-				fitted[i] = advanceProbability(fitted[i], multiplier);
+			}
+			case INTERCEPT: {
+				const RealType multiplier = std::exp(realDelta);
+				const size_t n = useWeightedUpdateRows ? sparseLogisticWeightedRows.size() : K;
+				for (size_t row = 0; row < n; ++row) {
+					const int i = useWeightedUpdateRows ? sparseLogisticWeightedRows[row] : static_cast<int>(row);
+				updateProbability(i, multiplier);
 			}
 			break;
 		}
@@ -1333,6 +2066,15 @@ void ModelSpecifics<BaseModel,RealType>::updateSparseLogisticState(
 
 	sparseLogisticExpXBetaDirty = true;
 	sparseLogisticXBetaDirty = true;
+		if (profileSparseLogisticHotLoops) {
+			const auto perfEnd = std::chrono::steady_clock::now();
+			sparseLogisticPerformanceCounters.updateCalls += 1;
+			sparseLogisticPerformanceCounters.nnzUpdate +=
+				getSparseLogisticColumnScanSize(index, useWeightedUpdateRows);
+			sparseLogisticPerformanceCounters.updateSeconds +=
+				std::chrono::duration<double>(perfEnd - perfStart).count();
+		}
+	return static_cast<double>(fittedChange);
 }
 
 // TODO The following function is an example of a double-dispatch, rewrite without need for virtual function
@@ -1350,6 +2092,7 @@ void ModelSpecifics<BaseModel,RealType>::computeGradientAndHessian(int index, do
 	    *ogradient = 0.0; *ohessian = 0.0;
 	    return;
 	}
+	ensureSparseIndices();
 
 	// Run-time dispatch, so virtual call should not effect speed
 	if (useWeights) {
@@ -1849,6 +2592,7 @@ void ModelSpecifics<BaseModel,RealType>::computeThirdDerivative(int index, doubl
         *othird = 0.0;
         return;
     }
+    ensureSparseIndices();
 
     // Run-time dispatch, so virtual call should not effect speed
     if (useWeights) {
@@ -2163,6 +2907,7 @@ void ModelSpecifics<BaseModel,RealType>::computeNumeratorForGradient(int index, 
 #endif
 #endif
 
+	ensureSparseIndices();
 	if (BaseModel::hasNtoKIndices || BaseModel::cumulativeGradientAndHessian) {
 
 		switch (hX.getFormatType(index)) {
@@ -2764,6 +3509,14 @@ void ModelSpecifics<BaseModel,RealType>::setupSparseIndices(const int max) {
             sparseIndices.push_back(indices);
         }
     }
+    sparseIndicesReady = true;
+}
+
+template <class BaseModel,typename RealType>
+void ModelSpecifics<BaseModel,RealType>::ensureSparseIndices() {
+    if (!sparseIndicesReady) {
+        setupSparseIndices(N);
+    }
 }
 
 template <class BaseModel,typename RealType>
@@ -2810,7 +3563,12 @@ void ModelSpecifics<BaseModel,RealType>::initialize(
     } else {
         // TODO Suspect below is not necessary for non-grouped data.
         // If true, then fill with pointers to CompressedDataColumn and do not delete in destructor
-        setupSparseIndices(N); // Need to be recomputed when hPid change!
+        if (std::is_same<BaseModel, LogisticRegression<RealType>>::value) {
+            sparseIndices.clear();
+            sparseIndicesReady = false;
+        } else {
+            setupSparseIndices(N); // Need to be recomputed when hPid change!
+        }
     }
 #ifdef CYCLOPS_DEBUG_TIMING_GPU_COX
 	auto end = std::chrono::steady_clock::now();
