@@ -7,9 +7,10 @@ usage <- function(status = 0) {
     "    --matrix-rds data.rds --out fold-local-comparison.csv\n\n",
     "  Rscript extras/benchmarks/benchmark_fold_local_active_comparison.R \\\n",
     "    --plp-data /path/to/plpData --outcome-id 123 --out fold-local-comparison.csv\n\n",
-    "Runs two sequential benchmarks and combines results into one CSV:\n",
-    "  1. sparse-residual-active\n",
-    "  2. sparse-residual-active with CYCLOPS_FOLD_LOCAL_CV=1\n\n",
+    "Runs three sequential benchmarks and combines results into one CSV:\n",
+    "  1. sparse-residual                         (new kernel only)\n",
+    "  2. sparse-residual-active                  (new kernel + active set)\n",
+    "  3. sparse-residual-active + fold-local CV  (new kernel + active set + fold-local)\n\n",
     "Required input, choose one:\n",
     "  --matrix-rds PATH        RDS list with x=dgCMatrix and y=0/1 vector.\n",
     "  --plp-data PATH          Saved PLP data directory or RDS object.\n\n",
@@ -134,7 +135,7 @@ script_path <- function() {
                 mustWork = FALSE)
 }
 
-make_child_args <- function(args, out_path) {
+make_child_args <- function(args, out_path, kernel) {
   child <- c(
     "--out", out_path,
     "--mode", "cv",
@@ -147,7 +148,7 @@ make_child_args <- function(args, out_path) {
     "--lower-limit", as.character(args$lower_limit),
     "--upper-limit", as.character(args$upper_limit),
     "--grid-steps", as.character(args$grid_steps),
-    "--kernels", "sparse-residual-active",
+    "--kernels", kernel,
     "--sparse-convergence-type", "fitted-change",
     "--cv-polish-policy", "selective",
     "--cv-polish-tolerance", "1e-8",
@@ -169,7 +170,7 @@ make_child_args <- function(args, out_path) {
   c(child, args$pass_through)
 }
 
-run_child <- function(label, fold_local, args, out_path) {
+run_child <- function(label, kernel, fold_local, args, out_path) {
   old <- Sys.getenv("CYCLOPS_FOLD_LOCAL_CV", unset = NA_character_)
   on.exit({
     if (is.na(old)) {
@@ -185,8 +186,9 @@ run_child <- function(label, fold_local, args, out_path) {
     Sys.unsetenv("CYCLOPS_FOLD_LOCAL_CV")
   }
 
-  cmd_args <- make_child_args(args, out_path)
+  cmd_args <- make_child_args(args, out_path, kernel)
   cat("\n== Running ", label, " ==\n", sep = "")
+  cat("kernel=", kernel, "\n", sep = "")
   cat("CYCLOPS_FOLD_LOCAL_CV=", Sys.getenv("CYCLOPS_FOLD_LOCAL_CV", unset = "<unset>"), "\n", sep = "")
   status <- system2(file.path(R.home("bin"), "Rscript"),
                     c(args$benchmark_script, cmd_args))
@@ -195,6 +197,7 @@ run_child <- function(label, fold_local, args, out_path) {
   }
   result <- read.csv(out_path, stringsAsFactors = FALSE)
   result$run_label <- label
+  result$comparison_layer <- label
   result$fold_local <- fold_local
   result$source_csv <- out_path
   result
@@ -217,21 +220,27 @@ main <- function() {
     stop("Cannot find benchmark script: ", args$benchmark_script)
   }
 
+  new_kernel_csv <- file.path(args$work_dir, "new-kernel-only.csv")
   active_csv <- file.path(args$work_dir, "active-baseline.csv")
   fold_local_csv <- file.path(args$work_dir, "active-fold-local.csv")
 
-  active <- run_child("active-baseline", FALSE, args, active_csv)
-  fold_local <- run_child("active-fold-local", TRUE, args, fold_local_csv)
-  combined <- rbind(active, fold_local)
+  new_kernel <- run_child("new-kernel-only", "sparse-residual", FALSE, args, new_kernel_csv)
+  active <- run_child("active-baseline", "sparse-residual-active", FALSE, args, active_csv)
+  fold_local <- run_child("active-fold-local", "sparse-residual-active", TRUE, args, fold_local_csv)
+  combined <- rbind(new_kernel, active, fold_local)
 
+  new_kernel_elapsed <- new_kernel$elapsed_sec[[1L]]
   baseline_elapsed <- active$elapsed_sec[[1L]]
+  combined$speedup_vs_new_kernel_only <- new_kernel_elapsed / combined$elapsed_sec
+  combined$elapsed_delta_vs_new_kernel_sec <- combined$elapsed_sec - new_kernel_elapsed
   combined$speedup_vs_active_baseline <- baseline_elapsed / combined$elapsed_sec
   combined$elapsed_delta_vs_active_sec <- combined$elapsed_sec - baseline_elapsed
 
   write.csv(combined, args$out, row.names = FALSE)
   cat("\nWrote combined result: ", args$out, "\n", sep = "")
   print(combined[, intersect(
-    c("run_label", "elapsed_sec", "speedup_vs_active_baseline", "return_flag",
+    c("run_label", "kernel", "elapsed_sec", "speedup_vs_new_kernel_only",
+      "speedup_vs_active_baseline", "return_flag",
       "variance", "nonzero", "kkt_max_violation", "objective_diff_vs_reference"),
     names(combined)
   )])
