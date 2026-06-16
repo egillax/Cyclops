@@ -7,10 +7,11 @@ usage <- function(status = 0) {
     "    --matrix-rds data.rds --out fold-local-comparison.csv\n\n",
     "  Rscript extras/benchmarks/benchmark_fold_local_active_comparison.R \\\n",
     "    --plp-data /path/to/plpData --outcome-id 123 --out fold-local-comparison.csv\n\n",
-    "Runs three sequential benchmarks and combines results into one CSV:\n",
-    "  1. sparse-residual                         (new kernel only)\n",
-    "  2. sparse-residual-active                  (new kernel + active set)\n",
-    "  3. sparse-residual-active + fold-local CV  (new kernel + active set + fold-local)\n\n",
+    "Runs four sequential benchmarks and combines results into one CSV:\n",
+    "  1. legacy                                  (legacy Cyclops kernel)\n",
+    "  2. sparse-residual                         (new kernel only)\n",
+    "  3. sparse-residual-active                  (new kernel + active set)\n",
+    "  4. sparse-residual-active + fold-local CV  (new kernel + active set + fold-local)\n\n",
     "Required input, choose one:\n",
     "  --matrix-rds PATH        RDS list with x=dgCMatrix and y=0/1 vector.\n",
     "  --plp-data PATH          Saved PLP data directory or RDS object.\n\n",
@@ -220,17 +221,22 @@ main <- function() {
     stop("Cannot find benchmark script: ", args$benchmark_script)
   }
 
+  legacy_csv <- file.path(args$work_dir, "legacy.csv")
   new_kernel_csv <- file.path(args$work_dir, "new-kernel-only.csv")
   active_csv <- file.path(args$work_dir, "active-baseline.csv")
   fold_local_csv <- file.path(args$work_dir, "active-fold-local.csv")
 
+  legacy <- run_child("legacy", "legacy", FALSE, args, legacy_csv)
   new_kernel <- run_child("new-kernel-only", "sparse-residual", FALSE, args, new_kernel_csv)
   active <- run_child("active-baseline", "sparse-residual-active", FALSE, args, active_csv)
   fold_local <- run_child("active-fold-local", "sparse-residual-active", TRUE, args, fold_local_csv)
-  combined <- rbind(new_kernel, active, fold_local)
+  combined <- rbind(legacy, new_kernel, active, fold_local)
 
+  legacy_elapsed <- legacy$elapsed_sec[[1L]]
   new_kernel_elapsed <- new_kernel$elapsed_sec[[1L]]
   baseline_elapsed <- active$elapsed_sec[[1L]]
+  combined$speedup_vs_legacy <- legacy_elapsed / combined$elapsed_sec
+  combined$elapsed_delta_vs_legacy_sec <- combined$elapsed_sec - legacy_elapsed
   combined$speedup_vs_new_kernel_only <- new_kernel_elapsed / combined$elapsed_sec
   combined$elapsed_delta_vs_new_kernel_sec <- combined$elapsed_sec - new_kernel_elapsed
   combined$speedup_vs_active_baseline <- baseline_elapsed / combined$elapsed_sec
@@ -239,7 +245,8 @@ main <- function() {
   write.csv(combined, args$out, row.names = FALSE)
   cat("\nWrote combined result: ", args$out, "\n", sep = "")
   print(combined[, intersect(
-    c("run_label", "kernel", "elapsed_sec", "speedup_vs_new_kernel_only",
+    c("run_label", "kernel", "elapsed_sec", "speedup_vs_legacy",
+      "speedup_vs_new_kernel_only",
       "speedup_vs_active_baseline", "return_flag",
       "variance", "nonzero", "kkt_max_violation", "objective_diff_vs_reference"),
     names(combined)
