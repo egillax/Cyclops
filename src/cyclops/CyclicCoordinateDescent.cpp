@@ -2497,6 +2497,7 @@ double CyclicCoordinateDescent::getLogPriorGradient(int index) {
 double CyclicCoordinateDescent::getLogLikelihoodGradient(int index) {
 
 	checkAllLazyFlags();
+	modelSpecifics.syncSparseLogisticState();
 
 	double gradient, hessian;
 	computeNumeratorForGradient(index);
@@ -2583,6 +2584,7 @@ void CyclicCoordinateDescent::computeRatiosForGradientAndHessian(int index) {
 double CyclicCoordinateDescent::getHessianDiagonal(int index) {
 
 	checkAllLazyFlags();
+	modelSpecifics.syncSparseLogisticState();
 	double g_d1, g_d2;
 
 	computeNumeratorForGradient(index);

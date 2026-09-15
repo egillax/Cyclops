@@ -1774,6 +1774,10 @@ void ModelSpecifics<BaseModel,RealType>::computeSparseLogisticGradientAndHessian
 		perfStart = std::chrono::steady_clock::now();
 	}
 	refreshSparseLogisticState(useWeights);
+	// Fold weights invalidate column views independently of fitted probabilities.
+	if (useWeights) {
+		ensureSparseLogisticWeightedColumnViews();
+	}
 	const RealType* fitted = sparseLogisticFitted.data();
 	const RealType* weights = hKWeight.data();
 	const RealType one = static_cast<RealType>(1.0);
